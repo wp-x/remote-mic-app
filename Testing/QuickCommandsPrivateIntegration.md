@@ -2,8 +2,39 @@
 
 ## 适用版本或分支
 
-- 分支：最新 `main` 或由其直接创建的预览候选。
-- 适用版本：当前修复分支及其后续候选；`1.8.18 (110)` 和 `1.8.22 (114)` 均存在快捷指令 SwiftPM 资源路径崩溃，不得继续分发。
+- 分支：最新 `main`；测试包来自对应的受保护 staging artifact，不创建预览候选分支。
+- 适用版本：`1.9.10` 预览版候选及其后续版本；`1.8.18 (110)` 和 `1.8.22 (114)` 均存在快捷指令 SwiftPM 资源路径崩溃，不得继续分发。
+
+## 合并后私有包版本与宿主集成
+
+组合动作默认开放已通过 PR [GetSayAll/sayall-macro-platform#4](https://github.com/GetSayAll/sayall-macro-platform/pull/4) 合入 `main`；本次按键捕获修复对应私有包 Draft PR [#5](https://github.com/GetSayAll/sayall-macro-platform/pull/5)。宿主验证固定使用修复提交的完整 commit：
+
+```text
+60db6940d89bd401fe1c4a3563fe33113a436c8c
+```
+
+本地开发或验证时，将私有包 checkout 到该 commit（不得使用浮动的 `main`）：
+
+```bash
+git -C /Users/andy/Develop/Src/AISrc/sayall-macro-platform fetch origin main
+git -C /Users/andy/Develop/Src/AISrc/sayall-macro-platform checkout --detach 19080aa9e9f1289f9ab4cc5715f2067cb50c546e
+```
+
+宿主通过 `Package.swift` 的 `SAYALL_MACRO_PLATFORM_PATH` 注入本地包；最小测试命令为：
+
+```bash
+SAYALL_MACRO_PLATFORM_PATH=/Users/andy/Develop/Src/AISrc/sayall-macro-platform \
+REQUIRE_SAYALL_MACRO_PLATFORM=1 \
+swift test
+```
+
+构建 App 时继续使用 `./scripts/build-app.sh`，并同时设置 `SAYALL_MACRO_PLATFORM_PATH` 与 `REQUIRE_SAYALL_MACRO_PLATFORM=1`；构建后运行 `REQUIRE_SAYALL_MACRO_PLATFORM=1 ./scripts/verify-app.sh "dist/SayAll.app"` 检查模块确实被打包。CI、Preview staging 和签名发布 workflow 都必须使用同一个 40 位 SHA；修改 pin 后在宿主仓库执行：
+
+```bash
+./scripts/verify-release-dependency-pins.sh
+```
+
+该脚本会确认 macOS CI、预览和正式发布三条 workflow 的私有包 revision 一致且为完整 SHA。私有包缺失时，公开构建仍应保持组合动作入口隐藏并回退到原按键行为；本手册中的自动化验证不能替代最终签名包、真实遥控器、Intel Mac 和不同前后台状态的人工验收。
 
 ## 测试前准备
 
@@ -113,6 +144,24 @@ REQUIRE_SAYALL_MACRO_PLATFORM=1 \
 预期：文字位于遥控器左侧时右对齐，位于右侧时左对齐，文字和遥控器向页面中间靠拢。首次勾选时页面直接显示“左键单击目前执行：打开 Codex”和“保存后将改为：组合动作 A”；准备替换时显示当前组合动作 A 和保存后的组合动作 B；取消绑定时显示保存后恢复的按键动作。提示只在存在未保存的绑定变化时出现，保存或撤回变化后消失，全程不弹出额外窗口。
 
 失败判定：不显示保存前后的动作、显示错误的按键或触发方式、替换其他组合动作时仍显示按键页动作、保存后提示不消失、左右文字对齐方向错误，或提示遮挡遥控器和触发选项。
+
+### 用例三 G：组合动作按键选择模式与动作路由
+
+步骤：
+
+1. 打开“组合动作”页面，选择一个已保存动作；在未打开“选择遥控器按键”开关时，使用实体遥控器、Nearby 和 Web Remote 触发已绑定动作，并分别覆盖页面内测试成功后、切换到其他页面前后的场景。
+2. 打开“选择遥控器按键”开关，按下目标实体遥控器按键；观察当前绑定选择，再关闭开关并再次按键。
+3. 在开关打开时切换侧边栏、关闭设置窗口、隐藏无线麦 App，然后重新按键。
+4. 回到“按键映射”页面，验证原有“按键确定位置 / 选择锁定”流程；再返回组合动作页面重复步骤 1。
+
+预期：
+
+- 开关默认关闭；仅浏览、测试或编辑步骤时，遥控器和手机 / 网页按键继续执行原来的动作或已绑定的组合动作。
+- 开关打开时，按键只更新组合动作的当前绑定选择，不执行该按键动作；关闭后立即恢复动作执行。
+- 页面切换、视图销毁、设置窗口关闭和 App 隐藏都会退出捕获模式；恢复后按键不需要重启 App 即可执行。
+- “按键确定位置 / 选择锁定”原有功能仍可用，不被组合动作页面的显式模式改写。
+
+失败判定：开关关闭时按键仍被吞掉、开关打开时误执行动作、关闭或隐藏后仍持续捕获、手机 / 网页与实体遥控器行为不一致，或原按键确定位置流程失效。
 
 ### 用例三 A：最终 App 脱离构建缓存打开快捷指令
 

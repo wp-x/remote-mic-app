@@ -11,6 +11,8 @@ enum SettingsSection: String, CaseIterable, Identifiable {
     case connection
     case privateFeature
     case macros
+    case buttonProfiles
+    case membership
     case mapping
     case statistics
     case transcripts
@@ -24,6 +26,8 @@ enum SettingsSection: String, CaseIterable, Identifiable {
         case .connection: return "settings.section.connection"
         case .privateFeature: return ""
         case .macros: return ""
+        case .buttonProfiles: return ""
+        case .membership: return ""
         case .mapping: return "settings.section.buttons"
         case .statistics: return "settings.section.statistics"
         case .transcripts: return "settings.section.transcripts"
@@ -37,6 +41,8 @@ enum SettingsSection: String, CaseIterable, Identifiable {
         case .connection: return "link"
         case .privateFeature: return "sparkles"
         case .macros: return "command.square"
+        case .buttonProfiles: return "rectangle.3.group"
+        case .membership: return "crown.fill"
         case .mapping: return "keyboard"
         case .statistics: return "chart.bar.xaxis"
         case .transcripts: return "text.bubble.fill"
@@ -166,6 +172,8 @@ struct SettingsView: View {
     @ObservedObject var settings: AppSettings
     @ObservedObject private var privateFeature: PrivateFeatureIntegration
     @ObservedObject private var macroFeature: MacroFeatureIntegration
+    @ObservedObject private var membershipFeature: MembershipFeatureIntegration
+    @ObservedObject private var loginItemService: LoginItemService
     @ObservedObject private var updateInformation: UpdateInformationStore
     @EnvironmentObject private var localization: LocalizationStore
 
@@ -173,9 +181,12 @@ struct SettingsView: View {
     private let refreshUpdateInformation: () -> Void
     private let setDockIconVisible: (Bool) -> Void
     private let minimumContentSize: CGSize
+    private let initialShortcutPickerShowsKeyboard: Bool
     private static let sidebarSectionOrder: [SettingsSection] = [
         .mapping,
         .macros,
+        .buttonProfiles,
+        .membership,
         .statistics,
         .transcripts,
         .connection,
@@ -198,7 +209,6 @@ struct SettingsView: View {
     @State private var inputMonitoringGranted = HIDRemoteMonitor.isInputMonitoringGranted
     @State private var accessibilityGranted = KeyboardInjector.isAccessibilityTrusted
     @State private var configurationStatus: ConfigurationStatus?
-    @State private var isReleaseHistoryPresented = false
     @State private var isClearTrustedPhonesConfirmationPresented = false
     @State private var isWebRemoteSessionPresented = false
     @State private var isWebRemoteInvitePresented = false
@@ -220,19 +230,31 @@ struct SettingsView: View {
         setDockIconVisible: @escaping (Bool) -> Void = { _ in },
         initialSection: SettingsSection = .connection,
         initialShareSection: SettingsSection? = nil,
+        initialMappingEditingButton: RemoteButton? = nil,
+        initialMappingEditingTrigger: ButtonTrigger = .singleClick,
+        initialShortcutPickerShowsKeyboard: Bool = false,
         minimumContentSize: CGSize = CGSize(width: 980, height: 732)
     ) {
         self.model = model
         settings = model.settings
         privateFeature = model.privateFeature
         macroFeature = model.macroFeature
+        membershipFeature = model.membershipFeature
+        loginItemService = model.loginItemService
         self.updateInformation = updateInformation
         self.checkForUpdates = checkForUpdates
         self.refreshUpdateInformation = refreshUpdateInformation
         self.setDockIconVisible = setDockIconVisible
         self.minimumContentSize = minimumContentSize
+        self.initialShortcutPickerShowsKeyboard = initialShortcutPickerShowsKeyboard
         _selectedSection = State(initialValue: initialSection)
         _expandedShareSection = State(initialValue: initialShareSection)
+        _selectedRemoteButton = State(initialValue: initialMappingEditingButton ?? .ok)
+        _mappingEditingTarget = State(
+            initialValue: initialMappingEditingButton.map {
+                ShortcutEditingTarget(button: $0, trigger: initialMappingEditingTrigger)
+            }
+        )
     }
 
     var body: some View {
@@ -253,17 +275,23 @@ struct SettingsView: View {
         )
         .onAppear {
             refreshPermissionStates()
-            macroFeature.setEditorActive(selectedSection == .macros)
+            loginItemService.refresh()
+            macroFeature.setEditorActive(false)
+            membershipFeature.refreshIfNeeded()
         }
         .onChange(of: selectedSection) { section in
-            macroFeature.setEditorActive(section == .macros)
+            if section != .macros, section != .buttonProfiles {
+                macroFeature.setEditorActive(false)
+            }
         }
         .onDisappear {
             macroFeature.setEditorActive(false)
         }
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
             refreshPermissionStates()
+            loginItemService.refresh()
             resumeCustomMappingIfPermissionsGranted()
+            membershipFeature.refreshIfNeeded()
         }
         .onReceive(privateFeature.$isFeatureVisible.removeDuplicates()) { isVisible in
             if !isVisible, selectedSection == .privateFeature {
@@ -271,12 +299,15 @@ struct SettingsView: View {
             }
         }
         .onReceive(macroFeature.$isFeatureVisible.removeDuplicates()) { isVisible in
-            if !isVisible, selectedSection == .macros {
+            if !isVisible,
+               (selectedSection == .macros || selectedSection == .buttonProfiles) {
                 selectedSection = .about
             }
         }
-        .sheet(isPresented: $isReleaseHistoryPresented) {
-            ReleaseHistorySheet()
+        .onReceive(membershipFeature.$isFeatureVisible.removeDuplicates()) { isVisible in
+            if !isVisible, selectedSection == .membership {
+                selectedSection = .about
+            }
         }
         .sheet(isPresented: $isWebRemoteSessionPresented) {
             webRemoteSessionView
@@ -462,7 +493,8 @@ struct SettingsView: View {
         Self.sidebarSectionOrder.filter {
             switch $0 {
             case .privateFeature: privateFeature.isFeatureVisible
-            case .macros: macroFeature.isFeatureVisible
+            case .macros, .buttonProfiles: macroFeature.isFeatureVisible
+            case .membership: membershipFeature.isFeatureVisible
             default: true
             }
         }
@@ -475,7 +507,10 @@ struct SettingsView: View {
             VStack(spacing: 7) {
                 Image(systemName: sectionSystemImage(section))
                     .font(.system(size: 21, weight: .semibold))
-                if section == .privateFeature || section == .macros {
+                if section == .privateFeature
+                    || section == .macros
+                    || section == .buttonProfiles
+                    || section == .membership {
                     Text(sectionTitle(section))
                         .font(.system(size: 13, weight: .semibold))
                 } else {
@@ -529,6 +564,21 @@ struct SettingsView: View {
                     .padding(.horizontal, 22)
                     .padding(.vertical, 10)
                 }
+            } else {
+                aboutPage
+            }
+        case .buttonProfiles:
+            if macroFeature.isFeatureVisible {
+                macroFeature.buttonProfilesView(
+                    selectedRemoteProfileID: settings.selectedRemoteProfileID,
+                    hostActionSections: buttonProfileHostActionSections
+                )
+            } else {
+                aboutPage
+            }
+        case .membership:
+            if membershipFeature.isFeatureVisible {
+                membershipFeature.settingsView()
             } else {
                 aboutPage
             }
@@ -1008,6 +1058,18 @@ struct SettingsView: View {
                     .frame(maxWidth: .infinity, alignment: .topLeading)
                 }
                 .compatibilityScrollEdgeEffect()
+                .onAppear {
+                    guard let target = mappingEditingTarget else { return }
+                    let scrollTarget = settings.configuredAction(
+                        for: target.button,
+                        trigger: target.trigger
+                    ).action == .customShortcut
+                        ? "mapping-shortcut-editor-\(target.id)"
+                        : "mapping-action-editor"
+                    DispatchQueue.main.async {
+                        proxy.scrollTo(scrollTarget, anchor: .top)
+                    }
+                }
                 .onChange(of: mappingEditingTarget?.id) { targetID in
                     guard targetID != nil else { return }
                     DispatchQueue.main.async {
@@ -1090,53 +1152,107 @@ struct SettingsView: View {
 
     private var mappingFooter: some View {
         GlassPanel {
-            HStack(spacing: 16) {
-                Label(
-                    model.hidStatus.text(using: localization),
-                    systemImage: "keyboard"
-                )
+            VStack(alignment: .leading, spacing: 12) {
+                mappingHIDStatus
+                Divider()
+                mappingSelectionLockControl
+                Divider()
+                mappingVoiceKeyModeControl
+                Divider()
+                mappingVoiceFnTapControl
+                HStack {
+                    Spacer(minLength: 0)
+                    mappingRestoreDefaultsButton
+                }
+            }
+        }
+    }
+
+    private var mappingHIDStatus: some View {
+        Label(
+            model.hidStatus.text(using: localization),
+            systemImage: "keyboard"
+        )
+        .font(.system(size: 12))
+        .foregroundStyle(.secondary)
+        .lineLimit(2)
+    }
+
+    private var mappingSelectionLockControl: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Toggle("button_mapping.selection_lock", isOn: $isMappingSelectionLocked)
+                .font(.system(size: 12, weight: .medium))
+                .toggleStyle(.switch)
+            Text("button_mapping.selection_lock_hint_short")
                 .font(.system(size: 12))
                 .foregroundStyle(.secondary)
                 .lineLimit(2)
+        }
+        .help(localization.text("button_mapping.selection_lock_help"))
+    }
 
-                Divider().frame(height: 28)
-
-                VStack(alignment: .leading, spacing: 2) {
-                    Toggle("button_mapping.selection_lock", isOn: $isMappingSelectionLocked)
+    private var mappingVoiceKeyModeControl: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text("connection.voice_key_mode.title")
+                .font(.system(size: 12, weight: .medium))
+            Picker("connection.voice_key_mode.title", selection: Binding(
+                get: { settings.voiceKeyMode },
+                set: { model.setVoiceKeyMode($0) }
+            )) {
+                ForEach(VoiceKeyMode.allCases) { mode in
+                    Text(LocalizedStringKey(mode.localizationKey)).tag(mode)
+                }
+            }
+            .pickerStyle(.segmented)
+            .labelsHidden()
+            .controlSize(.small)
+            Text("connection.voice_key_mode.help")
+                .font(.system(size: 12))
+                .foregroundStyle(.secondary)
+                .lineLimit(3)
+            if settings.voiceKeyMode != .function {
+                Label {
+                    Text("connection.voice_key_mode.unverified")
                         .font(.system(size: 12, weight: .medium))
-                        .toggleStyle(.switch)
-                    Text("button_mapping.selection_lock_hint_short")
-                        .font(.system(size: 12))
-                        .foregroundStyle(.secondary)
-                        .lineLimit(2)
+                        .foregroundStyle(.orange)
+                        .fixedSize(horizontal: false, vertical: true)
+                } icon: {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .foregroundStyle(.orange)
                 }
-                .help(localization.text("button_mapping.selection_lock_help"))
-
-                Divider().frame(height: 28)
-
-                VStack(alignment: .leading, spacing: 2) {
-                    Toggle("connection.voice_fn_tap.enabled", isOn: Binding(
-                        get: { settings.voiceFnTapModeEnabled },
-                        set: { model.setVoiceFnTapModeEnabled($0) }
-                    ))
-                    .font(.system(size: 12, weight: .medium))
-                    .toggleStyle(.switch)
-                    Text("connection.voice_fn_tap.hint_short")
-                        .font(.system(size: 12))
-                        .foregroundStyle(.secondary)
-                        .lineLimit(2)
-                }
-                .help(localization.text("connection.voice_fn_tap.hint"))
-
-                Spacer(minLength: 0)
-
-                Button("common.action.restore_defaults") {
-                    settings.resetBindings()
-                    selectedRemoteButton = .ok
-                }
-                .compatibilityButtonStyle(.standard)
+                Text("connection.voice_key_mode.unverified_detail")
+                    .font(.system(size: 12))
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
             }
         }
+        .help(localization.text("connection.voice_key_mode.help"))
+    }
+
+    private var mappingVoiceFnTapControl: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Toggle("connection.voice_fn_tap.enabled", isOn: Binding(
+                get: { settings.voiceFnTapModeEnabled },
+                set: { model.setVoiceFnTapModeEnabled($0) }
+            ))
+            .font(.system(size: 12, weight: .medium))
+            .toggleStyle(.switch)
+            Text("connection.voice_fn_tap.hint_short")
+                .font(.system(size: 12))
+                .foregroundStyle(.secondary)
+                .lineLimit(2)
+        }
+        .help(localization.text("connection.voice_fn_tap.hint"))
+        .opacity(settings.voiceKeyMode == .function ? 1 : 0.55)
+        .disabled(settings.voiceKeyMode != .function)
+    }
+
+    private var mappingRestoreDefaultsButton: some View {
+        Button("common.action.restore_defaults") {
+            settings.resetBindings()
+            selectedRemoteButton = .ok
+        }
+        .compatibilityButtonStyle(.standard)
     }
 
     @ViewBuilder
@@ -1383,6 +1499,12 @@ struct SettingsView: View {
                 )
             }
 
+            if trigger == .singleClick,
+               configured.action != .disabled,
+               !configured.action.allowsRepeat {
+                mappingRapidPressControl(button: button)
+            }
+
             if button == .power && trigger == .singleClick && settings.experimentalContinuousRecordingEnabled {
                 Text("button_mapping.continuous_recording_experiment.power_managed")
                     .font(.system(size: 12))
@@ -1401,6 +1523,24 @@ struct SettingsView: View {
                     .foregroundStyle(.secondary)
             }
         }
+    }
+
+    private func mappingRapidPressControl(button: RemoteButton) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Toggle("button_mapping.rapid_press", isOn: Binding(
+                get: { settings.allowsRapidPress(for: button) },
+                set: { settings.setAllowsRapidPress($0, for: button) }
+            ))
+            .font(.system(size: 13, weight: .medium))
+            .toggleStyle(.switch)
+            Text("button_mapping.rapid_press_hint_short")
+                .font(.system(size: 12))
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .padding(12)
+        .background(Color.primary.opacity(0.035), in: RoundedRectangle(cornerRadius: 10))
+        .help(localization.text("button_mapping.rapid_press_help"))
     }
 
     @ViewBuilder
@@ -1556,38 +1696,50 @@ struct SettingsView: View {
                 )
                 .frame(height: 1)
             } else {
-                HStack(spacing: 10) {
-                    Label {
-                        Text(
-                            configured.shortcut?.displayName(using: localization) ??
-                                localization.text("shortcut.editor.not_recorded")
-                        )
-                    } icon: {
-                        Image(systemName: configured.shortcut == nil ? "keyboard" : "keyboard.badge.checkmark")
-                            .foregroundStyle(configured.shortcut == nil ? Color.secondary : Color.green)
-                    }
-                    .font(.system(size: 16, weight: .semibold, design: .rounded))
-                    .foregroundStyle(configured.shortcut == nil ? Color.secondary : Color.primary)
-                    .frame(maxWidth: .infinity, minHeight: 42, alignment: .leading)
-                    .padding(.horizontal, 12)
-                    .background(.quaternary, in: RoundedRectangle(cornerRadius: 9))
+                VStack(alignment: .leading, spacing: 12) {
+                    HStack(spacing: 10) {
+                        Label {
+                            Text(
+                                configured.shortcut?.displayName(using: localization) ??
+                                    localization.text("shortcut.editor.not_recorded")
+                            )
+                        } icon: {
+                            Image(systemName: configured.shortcut == nil ? "keyboard" : "keyboard.badge.checkmark")
+                                .foregroundStyle(configured.shortcut == nil ? Color.secondary : Color.green)
+                        }
+                        .font(.system(size: 16, weight: .semibold, design: .rounded))
+                        .foregroundStyle(configured.shortcut == nil ? Color.secondary : Color.primary)
+                        .frame(maxWidth: .infinity, minHeight: 42, alignment: .leading)
+                        .padding(.horizontal, 12)
+                        .background(.quaternary, in: RoundedRectangle(cornerRadius: 9))
 
-                    Button(configured.shortcut == nil ? "shortcut.action.record" : "shortcut.action.record_again") {
-                        applicationShortcutCaptureProfileID = nil
-                        shortcutCaptureFeedback = nil
-                        shortcutCaptureTarget = target
-                    }
-                    .compatibilityButtonStyle(.prominent)
+                        Button(configured.shortcut == nil ? "shortcut.action.record" : "shortcut.action.record_again") {
+                            applicationShortcutCaptureProfileID = nil
+                            shortcutCaptureFeedback = nil
+                            shortcutCaptureTarget = target
+                        }
+                        .compatibilityButtonStyle(.standard)
 
-                    Button("common.action.clear") {
-                        settings.setShortcut(nil, for: button, trigger: trigger)
-                        shortcutCaptureFeedback = nil
+                        Button("common.action.clear") {
+                            settings.setShortcut(nil, for: button, trigger: trigger)
+                            shortcutCaptureFeedback = nil
+                        }
+                        .compatibilityButtonStyle(.standard)
+                        .disabled(configured.shortcut == nil)
                     }
-                    .compatibilityButtonStyle(.standard)
-                    .disabled(configured.shortcut == nil)
+
+                    shortcutCaptureFeedbackView(contextID: contextID)
+
+                    KeyboardShortcutPicker(
+                        shortcut: configured.shortcut,
+                        showsStandardKeyboardInitially: initialShortcutPickerShowsKeyboard,
+                        onSelect: { shortcut in
+                            settings.setShortcut(shortcut, for: button, trigger: trigger)
+                            shortcutCaptureFeedback = nil
+                        }
+                    )
+                    .id("mapping-shortcut-editor-\(contextID)")
                 }
-
-                shortcutCaptureFeedbackView(contextID: contextID)
             }
         }
         .padding(12)
@@ -1982,6 +2134,53 @@ struct SettingsView: View {
         return configured.action.displayName(using: localization)
     }
 
+    private var buttonProfileHostActionSections: [ButtonProfileHostActionSection] {
+        let availableActions = ButtonAction.pickerActions(
+            installedBundleIdentifiers: PresetApplication.installedBundleIdentifiers,
+            current: .disabled,
+            experimentalContinuousRecordingEnabled: settings.experimentalContinuousRecordingEnabled
+        ).filter {
+            $0 != .disabled && $0 != .customShortcut && $0 != .openCustomApplication
+        }
+        return ButtonActionCategory.allCases.compactMap { category in
+            let actions: [ButtonProfileHostAction] = availableActions
+                .filter { $0.category == category }
+                .compactMap { action in
+                guard let payload = try? JSONEncoder().encode(ConfiguredButtonAction(
+                    action: action,
+                    shortcut: nil
+                )) else { return nil }
+                return ButtonProfileHostAction(
+                    id: "host.action.\(action.rawValue)",
+                    title: action.displayName(using: localization),
+                    detail: nil,
+                    systemImage: buttonProfileSystemImage(for: action),
+                    payload: payload,
+                    isAvailable: true
+                )
+                }
+            guard !actions.isEmpty else { return nil }
+            return ButtonProfileHostActionSection(
+                id: "host.section.\(category.rawValue)",
+                title: localization.text(category.localizationKey),
+                actions: actions
+            )
+        }
+    }
+
+    private func buttonProfileSystemImage(for action: ButtonAction) -> String {
+        if action.presetApplication != nil { return "app" }
+        switch action {
+        case .focusInput: return "scope"
+        case .showDesktop: return "macwindow"
+        case .appSwitcher: return "command"
+        case .volumeUp, .volumeDown, .volumeMute: return "speaker.wave.2"
+        case .playPause, .previousCommandLeft, .nextCommandRight: return "play.circle"
+        case .toggleLongRecording: return "record.circle"
+        default: return "keyboard"
+        }
+    }
+
     private var permissionsPage: some View {
         settingsPage {
             PageHeader(title: localization.text("permissions.page.title"))
@@ -2144,6 +2343,13 @@ struct SettingsView: View {
                 Toggle(
                     "statistics.transcripts.enable",
                     isOn: $settings.localTranscriptHistoryEnabled
+                )
+                .toggleStyle(.switch)
+                .font(.system(size: 13, weight: .medium))
+                .fixedSize()
+                Toggle(
+                    "statistics.transcripts.recording_enable",
+                    isOn: $settings.localOriginalAudioRecordingEnabled
                 )
                 .toggleStyle(.switch)
                 .font(.system(size: 13, weight: .medium))
@@ -2424,13 +2630,6 @@ struct SettingsView: View {
                             Divider()
 
                             HStack(spacing: 20) {
-                                Button {
-                                    isReleaseHistoryPresented = true
-                                } label: {
-                                    Label("about.version.history", systemImage: "clock.arrow.circlepath")
-                                }
-                                .compatibilityButtonStyle(.standard)
-
                                 Spacer()
 
                                 VStack(alignment: .trailing, spacing: 3) {
@@ -2536,6 +2735,52 @@ struct SettingsView: View {
                             Divider()
 
                             HStack(spacing: 14) {
+                                Image(systemName: "rectangle.portrait.and.arrow.forward")
+                                    .font(.title3)
+                                    .foregroundStyle(Color.accentColor)
+                                    .frame(width: 34)
+                                VStack(alignment: .leading, spacing: 3) {
+                                    Text("about.preferences.launch_at_login")
+                                        .font(.subheadline.weight(.semibold))
+                                    Text("about.preferences.launch_at_login_help")
+                                        .font(.system(size: 12))
+                                        .foregroundStyle(.secondary)
+                                        .fixedSize(horizontal: false, vertical: true)
+                                    if loginItemService.requiresApproval {
+                                        Text("about.preferences.launch_at_login_requires_approval")
+                                            .font(.system(size: 12))
+                                            .foregroundStyle(.orange)
+                                            .fixedSize(horizontal: false, vertical: true)
+                                    } else if loginItemService.didFailToUpdate {
+                                        Text("about.preferences.launch_at_login_update_failed")
+                                            .font(.system(size: 12))
+                                            .foregroundStyle(.red)
+                                            .fixedSize(horizontal: false, vertical: true)
+                                    }
+                                }
+                                Spacer(minLength: 16)
+                                VStack(alignment: .trailing, spacing: 8) {
+                                    Toggle("", isOn: Binding(
+                                        get: { loginItemService.isEnabled },
+                                        set: { loginItemService.setEnabled($0) }
+                                    ))
+                                    .labelsHidden()
+                                    .toggleStyle(.switch)
+
+                                    if loginItemService.requiresApproval {
+                                        Button(
+                                            "about.preferences.launch_at_login_open_system_settings",
+                                            action: loginItemService.openLoginItemsSettings
+                                        )
+                                        .compatibilityButtonStyle(.standard)
+                                    }
+                                }
+                            }
+                            .padding(.vertical, 10)
+
+                            Divider()
+
+                            HStack(spacing: 14) {
                                 Image(systemName: "macwindow")
                                     .font(.title3)
                                     .foregroundStyle(Color.accentColor)
@@ -2579,8 +2824,9 @@ struct SettingsView: View {
                                 }
                                 .labelsHidden()
                                 .pickerStyle(.segmented)
-                                .frame(width: 400)
+                                .frame(width: 300)
                             }
+                            .frame(maxWidth: .infinity, alignment: .leading)
                             .padding(.vertical, 10)
 
                             Divider()
@@ -2606,6 +2852,14 @@ struct SettingsView: View {
                             }
                             .padding(.vertical, 10)
                         }
+                    }
+
+                    if model.isRC003VoiceExtensionTestEnabled {
+                        Text("测试长时间语音功能")
+                            .font(.system(size: 12, weight: .medium))
+                            .foregroundStyle(.secondary)
+                            .frame(maxWidth: .infinity, alignment: .center)
+                            .padding(.vertical, 8)
                     }
                 }
             }
@@ -2661,6 +2915,8 @@ struct SettingsView: View {
         switch section {
         case .privateFeature: privateFeature.sectionTitle
         case .macros: macroFeature.sectionTitle
+        case .buttonProfiles: macroFeature.buttonProfilesSectionTitle
+        case .membership: membershipFeature.sectionTitle
         default: ""
         }
     }
@@ -2669,6 +2925,8 @@ struct SettingsView: View {
         switch section {
         case .privateFeature: privateFeature.sectionSystemImage
         case .macros: macroFeature.sectionSystemImage
+        case .buttonProfiles: macroFeature.buttonProfilesSectionSystemImage
+        case .membership: membershipFeature.sectionSystemImage
         default: section.systemImage
         }
     }
@@ -2933,11 +3191,9 @@ struct SettingsView: View {
             prompt: localization.text("configuration.import.prompt")
         ) else { return }
         do {
-            try settings.importConfiguration(from: Data(contentsOf: url))
+            try model.importConfiguration(from: Data(contentsOf: url))
             localization.select(settings.applicationLanguage)
             setDockIconVisible(settings.showDockIcon)
-            model.applyAudioSettings(reason: "configuration_import")
-            model.applyHIDSettings()
             configurationStatus = ConfigurationStatus(
                 message: LocalizedMessage("configuration.import.success"),
                 tint: .green,
@@ -2946,6 +3202,12 @@ struct SettingsView: View {
         } catch AppConfigurationError.unsupportedVersion {
             configurationStatus = ConfigurationStatus(
                 message: LocalizedMessage("configuration.import.unsupported_version"),
+                tint: .red,
+                systemImage: "exclamationmark.triangle.fill"
+            )
+        } catch AppConfigurationError.unsafeVoiceKeyChange {
+            configurationStatus = ConfigurationStatus(
+                message: LocalizedMessage("configuration.import.voice_key_busy"),
                 tint: .red,
                 systemImage: "exclamationmark.triangle.fill"
             )
@@ -3174,96 +3436,6 @@ enum UsageStatisticsPresentation {
         guard roundedDuration < Double(Int.max) else { return .max }
         return Int(roundedDuration)
     }
-}
-
-private struct ReleaseHistorySheet: View {
-    @Environment(\.dismiss) private var dismiss
-    @EnvironmentObject private var localization: LocalizationStore
-
-    var body: some View {
-        VStack(spacing: 0) {
-            HStack {
-                Text(localization.text("about.version.history"))
-                    .font(.title2.weight(.semibold))
-                Spacer()
-                Button(localization.text("common.action.close")) { dismiss() }
-                    .keyboardShortcut(.cancelAction)
-            }
-            .padding(20)
-
-            Divider()
-
-            ScrollView(.vertical, showsIndicators: false) {
-                if let sections = releaseHistorySections {
-                    LazyVStack(alignment: .leading, spacing: 24) {
-                        ForEach(sections) { section in
-                            VStack(alignment: .leading, spacing: 10) {
-                                Text(section.title)
-                                    .font(.title3.weight(.semibold).monospacedDigit())
-
-                                ForEach(Array(section.entries.enumerated()), id: \.offset) { _, entry in
-                                    HStack(alignment: .firstTextBaseline, spacing: 8) {
-                                        Text("•")
-                                        Text(entry)
-                                            .fixedSize(horizontal: false, vertical: true)
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    .frame(maxWidth: .infinity, alignment: .topLeading)
-                    .textSelection(.enabled)
-                    .padding(24)
-                } else {
-                    Text(localization.text("about.version.history_load_failed"))
-                        .frame(maxWidth: .infinity, alignment: .topLeading)
-                        .padding(24)
-                }
-            }
-        }
-        .frame(width: 640, height: 520)
-    }
-
-    private var releaseHistorySections: [ReleaseHistorySection]? {
-        guard let url = localization.localizedURL(
-            forResource: "ReleaseHistory",
-            withExtension: "md"
-        ),
-        let markdown = try? String(contentsOf: url, encoding: .utf8)
-        else {
-            return nil
-        }
-
-        var sections: [ReleaseHistorySection] = []
-        var title: String?
-        var entries: [String] = []
-
-        func appendSection() {
-            guard let title, !entries.isEmpty else { return }
-            sections.append(ReleaseHistorySection(title: title, entries: entries))
-        }
-
-        for rawLine in markdown.components(separatedBy: .newlines) {
-            let line = rawLine.trimmingCharacters(in: .whitespaces)
-            if line.hasPrefix("## ") {
-                appendSection()
-                title = String(line.dropFirst(3))
-                entries = []
-            } else if line.hasPrefix("- "), title != nil {
-                entries.append(String(line.dropFirst(2)))
-            }
-        }
-        appendSection()
-
-        return sections.isEmpty ? nil : sections
-    }
-}
-
-private struct ReleaseHistorySection: Identifiable {
-    let title: String
-    let entries: [String]
-
-    var id: String { title }
 }
 
 private final class WindowDragNSView: NSView {

@@ -1,5 +1,69 @@
 # Version History
 
+## 1.9.21 (Pre-release)
+
+- Improves update check reliability and reduces intermittent failures to retrieve update information.
+
+## 1.9.20 (Pre-release)
+
+- Standardize first-run onboarding on the Fn voice key to reduce setup ambiguity.
+- Add a migration notice for existing voice-key settings.
+- Improve first-run microphone, audio-output, and voice-result diagnostics with clearer failure reasons.
+- Fix an issue where Fn tap mode could be disabled while a remote was still preparing its connection.
+- Refresh the images used in the project documentation.
+
+## 1.9.19 (Pre-release)
+
+- Improve Onboarding permission back navigation, voice test input focus, and diagnostics.
+- Keep the “Other voice tool” option when known tools are not installed, with an official Doubao installation link.
+- Improve actionable Reflections playback errors for missing, modified, unreadable, and player-start failures.
+- Restore the selected voice-key mapping after remote wake.
+- Move SayAll, legacy app paths, and the driver to the Trash during uninstall, with rollback on replacement failure.
+- Remove the Finder entry from recording-only Reflections records while keeping playback, export, and Trash actions.
+
+## 1.9.18 (Pre-release)
+
+- Improved Reflections browsing stability for large histories, avoiding duplicate, blank, and jittery rows.
+- All Apps now shows the last 7 days by default; select an app to view its complete history.
+
+## 1.9.17 (Pre-release)
+
+- Improved first-run voice-tool setup with installation detection and guidance for WeChat Input, Typeless, and Doubao.
+- Added Fn/Globe, Left Command, and Right Command voice-trigger choices during onboarding while keeping Typeless on Fn press.
+- Automatically switches to the selected input source and avoids sending upgraded users through the full onboarding flow again.
+- Fixed semantic-version update detection when a preview build has a higher build number than the candidate.
+- Removed the Version History button that opened downloadable text; the About page now shows localized release notes directly.
+
+## 1.9.16 (Pre-release)
+
+- Added Left Command and Right Command voice-trigger modes while keeping Fn/Globe as the default.
+- Voice keys now start on press and end on release without focus-gesture delays; input focus is available as a separate regular remote-button action.
+- Improved focus reliability for Electron, Web, search, and Terminal input fields.
+- Fixed RC003 TV-key characters leaking into the frontmost text field across keyboard layouts.
+- Improved Bluetooth recovery after Mac wake and audio-failure diagnostics.
+- Added remote control of the macOS Command-Tab app switcher.
+- Added an optional rapid-press setting for non-repeatable actions, disabled by default.
+- Fixed the combination-action editor from consuming ordinary remote-button events.
+- Added local original-recording storage and improved Reflections records when no editable input field is available.
+- Added Up and Down scroll actions for remote buttons.
+- Improved alignment of the language selector on the About page.
+
+## 1.9.10 (Pre-release)
+
+- Combination Actions are now available by default, with no invitation code required to view, create, bind, or use them.
+
+## 1.9.9 (Pre-release)
+
+- Added an opt-in “Launch at login” setting under About → App Preferences, with a direct link to macOS Login Items Settings when approval is required.
+- Added in-page keyboard shortcut selection for common keys, navigation keys, F1–F20, the numeric keypad, and independent left/right modifiers while retaining physical-key recording.
+- Improved first-run and permission recovery: onboarding centers after sizing, and enabled custom button mappings are reapplied after Input Monitoring or Accessibility permissions change.
+- Runtime voice input now selects only an enabled preferred input source, avoids repeated confirmation prompts, and restores the previous input source unless you changed it during the session.
+- Improved Bluetooth recovery for stale cached remotes with bounded backoff and power-recovery handling without losing saved profiles or mappings.
+- Reduced unnecessary UI invalidation during voice streaming while preserving audio processing and diagnostics.
+- Prevented duplicate SayAll instances; reopening the app activates the existing instance instead of starting another Bluetooth, audio, or HID stack.
+- Kept the Settings window visible when switching apps and retained its Dock presence until the window is actually closed.
+- Fixed the RC003 monitored-mode TV button leaking a “§” character into the frontmost text field when mapped to a custom action.
+
 ## 1.9.8 (Pre-release)
 
 - Improved upgrades from older Remote Mic installations: the previous app now stops before the audio driver is updated, and the new SayAll.app stays at its canonical Applications location so audio setup can continue reliably after the upgrade.

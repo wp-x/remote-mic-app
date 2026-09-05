@@ -1,5 +1,22 @@
 # Bug 记录
 
+- [Onboarding 语音测试页隐藏第三方配置](./2026-09-05-onboarding-voice-test-hidden-tool-configuration.md)
+- [1.9.19 偶发显示“暂时无法获取更新信息”](./2026-09-03-github-api-update-feed-unavailable/DEBUG.md)
+- [Onboarding 语音诊断无法区分焦点、音频输出与第三方未提交](./2026-08-31-onboarding-voice-attempt-diagnostics/DEBUG.md)
+- [Onboarding 选择其他语音工具时隐藏豆包官方安装入口](./2026-08-29-onboarding-doubao-install-link-hidden.md)
+- [Onboarding 已收到语音但没有文字，诊断事件反复跳变](./2026-08-29-onboarding-voice-test-focus-and-diagnostics.md)
+- [Onboarding 权限页返回按钮点击后停留原页](./2026-08-29-onboarding-permissions-back-auto-route.md)
+- [预览包 Build 回退导致更新误判与版本历史按钮误导](./2026-08-27-sparkle-preview-build-regression-and-history-button.md)
+
+- [回眸无可编辑输入框时录音归为未知应用且不可见](./2026-08-27-reflections-recording-metadata-fallback.md)
+- [1.9.13 搜索框与 cmux 语音输入边界](./2026-08-26-voice-input-search-and-cmux-boundary.md)
+- [休眠唤醒后蓝牙失效，以及豆包有电平但没有文字](./2026-08-25-sleep-wake-and-doubao-voice-failure.md)
+- [自定义快捷键连续快速按只有第一次生效](./2026-08-25-custom-shortcut-rapid-press-dropped.md)
+- [历史蓝牙缓存持续固定频率重连](./2026-08-24-ble-cached-reconnect-storm.md)
+- [运行日志缺少实例归属、轮转与有效降噪](./2026-08-24-runtime-log-operational-quality.md)
+- [语音流期间进程 CPU 接近占满单核](./2026-08-24-voice-stream-cpu-saturation.md)
+- [不同版本的无线麦可同时运行](./2026-08-24-duplicate-app-instances.md)
+- [语音结束时最后一个词偶发未识别](./2026-08-24-final-word-tail-loss/DEBUG.md)
 - [设置窗口在失去焦点后被移出屏幕](./2026-08-22-settings-window-hides-on-deactivate.md)
 - [Intel macOS 13 将 SayAll App 图标显示为完整正方形](./2026-08-21-intel-macos13-square-app-icon.md)
 - [预览发布身份校验缺少 GH_TOKEN](./2026-08-21-release-identity-missing-gh-token.md)
@@ -61,6 +78,23 @@
 
 | 时间 | Bug | 状态 |
 | --- | --- | --- |
+| 2026-09-03 | [1.9.19 偶发显示“暂时无法获取更新信息”](./2026-09-03-github-api-update-feed-unavailable/DEBUG.md) | 候选修复、自动化与生产通道部署完成，等待 `1.9.21` 真实 Sparkle UI 验收 |
+| 2026-09-01 | [1.9.18「语音键模拟 Fn 点按」自动关闭](./2026-09-01-fn-tap-auto-disable/DEBUG.md) | 根因确认并完成候选修复；自动化通过，等待 RC003 与 Typeless 真机验收 |
+| 2026-08-31 | [Onboarding 语音诊断无法区分焦点、音频输出与第三方未提交](./2026-08-31-onboarding-voice-attempt-diagnostics/DEBUG.md) | 用户确认豆包麦克风配置根因；候选诊断、双端确认卡和本地完整验证完成，等待 PR CI 与独立真机验收 |
+| 2026-08-31 | [Onboarding 允许 Command 导致第三方语音工具不提交文字](./2026-08-31-onboarding-voice-key-policy-mismatch.md) | 修复完成，等待 PR CI 与真实第三方工具验收 |
+| 2026-08-29 | [Issue #101：卸载 PKG 运行后 App 仍保留](./2026-08-29-issue-101-uninstaller-keeps-app.md) | 候选修复完成，等待正式签名 PKG 与双架构真实卸载验收 |
+| 2026-08-29 | [Onboarding 选择其他语音工具时隐藏豆包官方安装入口](./2026-08-29-onboarding-doubao-install-link-hidden.md) | 候选修复完成，58 张生产截图复验通过 |
+| 2026-08-29 | [Onboarding 已收到语音但没有文字，诊断事件反复跳变](./2026-08-29-onboarding-voice-test-focus-and-diagnostics.md) | 候选修复完成，等待真实第三方语音工具验收 |
+| 2026-08-29 | [Onboarding 权限页返回按钮点击后停留原页](./2026-08-29-onboarding-permissions-back-auto-route.md) | 候选修复完成，等待真实点击复验 |
+| 2026-08-27 | [回眸无可编辑输入框时录音归为未知应用且不可见](./2026-08-27-reflections-recording-metadata-fallback.md) | 候选修复完成，等待真实 RC003 与第三方 App 验收 |
+| 2026-08-26 | [1.9.13 搜索框与 cmux 语音输入边界](./2026-08-26-voice-input-search-and-cmux-boundary.md) | 最小候选修复完成，等待 Spotlight、Launchpad、飞书/Lark、cmux 和豆包真实验收 |
+| 2026-08-25 | [休眠唤醒后蓝牙失效，以及豆包有电平但没有文字](./2026-08-25-sleep-wake-and-doubao-voice-failure.md) | 补充 HID 晚到候选修复；真实休眠唤醒基础路径通过，等待现场命中重试分支 |
+| 2026-08-25 | [自定义快捷键连续快速按只有第一次生效](./2026-08-25-custom-shortcut-rapid-press-dropped.md) | 候选修复完成；自动化与项目自检通过，等待 RC001 / RC003 真机连按验收 |
+| 2026-08-24 | [历史蓝牙缓存持续固定频率重连](./2026-08-24-ble-cached-reconnect-storm.md) | 自动化、硬件模拟与 Release App 验证通过，等待 RC001 / RC003 真机重连验收 |
+| 2026-08-24 | [运行日志缺少实例归属、轮转与有效降噪](./2026-08-24-runtime-log-operational-quality.md) | 候选修复完成；自动化、事务故障夹具与 Release App 验证通过，等待真实 BLE / CoreAudio、废纸篓权限与长时间运行验收 |
+| 2026-08-24 | [语音流期间进程 CPU 接近占满单核](./2026-08-24-voice-stream-cpu-saturation.md) | 候选修复完成；自动化、项目自检与 Release App 验证通过，等待真实 RC003 性能对照 |
+| 2026-08-24 | [不同版本的无线麦可同时运行](./2026-08-24-duplicate-app-instances.md) | 修复完成，等待双版本、登录项与 Sparkle 更新真实验收 |
+| 2026-08-24 | [语音结束时最后一个词偶发未识别](./2026-08-24-final-word-tail-loss/DEBUG.md) | 调查中，诊断日志已补充；尚未修复，等待 RC003/豆包标记会话 |
 | 2026-08-22 | [设置窗口在失去焦点后被移出屏幕](./2026-08-22-settings-window-hides-on-deactivate.md) | 第三轮候选修复完成，等待可见 App 验收 |
 | 2026-08-21 | [Intel macOS 13 将 SayAll App 图标显示为完整正方形](./2026-08-21-intel-macos13-square-app-icon.md) | 候选修复完成，等待真实 Intel macOS 13 图标与缓存验收 |
 | 2026-08-20 | [HID 遥控器被其他输入工具占用时 Onboarding 无法继续](./2026-08-20-hid-exclusive-access-input-tools.md) | 候选修复完成，等待 Karabiner-Elements 与其他 HID 工具真机验收 |
@@ -147,7 +181,10 @@
 | 2026-08-21 | [签名前失败的 attestation 阻止同版本预览恢复](./2026-08-21-pre-signing-attestation-blocks-preview-recovery.md) | 已修复，自动化验证通过；等待受保护预览发布验证 |
 | 2026-08-21 | [预览发布身份校验缺少 GH_TOKEN](./2026-08-21-release-identity-missing-gh-token.md) | 已修复，`v1.9.6` 受保护预览发布验证通过 |
 | 2026-08-21 | [Onboarding 离开输入法页后重复触发输入法确认](./2026-08-21-onboarding-input-source-confirmation-repeats.md) | 已修复，自动化通过；等待豆包/微信输入法真机验收 |
+| 2026-08-23 | [运行时切换输入法反复触发系统确认且不会恢复原输入法](./2026-08-23-runtime-input-source-confirmation-and-restore.md) | 候选修复完成，等待真实豆包/微信输入法与遥控器验收 |
 | 2026-08-21 | [设置页只展示已连接遥控器](./2026-08-21-settings-connected-remotes-only.md) | 已修复，自动化与构建通过；等待真实双遥控器和首次配对验收 |
+| 2026-08-20 | [重新授权后 HID 监听未恢复](./2026-08-20-hid-permission-recovery.md) | 候选修复完成，等待真实权限与遥控器验收 |
+| 2026-08-28 | [回眸记录过多时重复、空白、卡顿及应用记录不可见](./2026-08-28-transcript-history-list-identity-and-window.md) | 候选修复完成，等待大规模归档与微信真机 UI 验收 |
 
 ## 记录模板
 

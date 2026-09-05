@@ -1,4 +1,5 @@
 import AppKit
+import AVFoundation
 import Combine
 import CoreAudio
 import Foundation
@@ -40,6 +41,65 @@ enum MobileVoiceRestartPolicy {
         pending: MobileVoiceSource?
     ) -> Bool {
         pending == stopped
+    }
+}
+
+struct HIDPermissionSnapshot: Equatable {
+    let inputMonitoringGranted: Bool
+    let accessibilityGranted: Bool
+
+    static var current: HIDPermissionSnapshot {
+        HIDPermissionSnapshot(
+            inputMonitoringGranted: HIDRemoteMonitor.isInputMonitoringGranted,
+            accessibilityGranted: KeyboardInjector.isAccessibilityTrusted
+        )
+    }
+}
+
+enum HIDPermissionRecoveryPolicy {
+    static func shouldReapplySettings(
+        started: Bool,
+        customMappingEnabled: Bool,
+        voiceKeyMode: VoiceKeyMode = .function,
+        voiceFnTapModeEnabled: Bool = false,
+        softwareVoiceKeyHeld: Bool = false,
+        previous: HIDPermissionSnapshot?,
+        current: HIDPermissionSnapshot
+    ) -> Bool {
+        guard started,
+              (
+                  customMappingEnabled ||
+                      voiceKeyMode.requiresAccessibility ||
+                      voiceFnTapModeEnabled ||
+                      softwareVoiceKeyHeld
+              ),
+              let previous
+        else { return false }
+        return previous != current
+    }
+}
+
+enum HIDMappingRecoveryPolicy {
+    static let retryDelays: [TimeInterval] = [0.5, 1, 2, 4, 8]
+
+    static func shouldPreserveFnTapPreferenceAfterMappingFailure(
+        hasMatchingServices: Bool
+    ) -> Bool {
+        !hasMatchingServices
+    }
+
+    static func retryDelay(
+        forAttempt attempt: Int,
+        started: Bool,
+        readyBridgeCount: Int,
+        hasMatchingServices: Bool
+    ) -> TimeInterval? {
+        guard started,
+              readyBridgeCount > 0,
+              !hasMatchingServices,
+              retryDelays.indices.contains(attempt)
+        else { return nil }
+        return retryDelays[attempt]
     }
 }
 
@@ -144,13 +204,121 @@ enum BluetoothVoiceStopPolicy {
     }
 }
 
+enum VoiceSamplePresentationPolicy {
+    static func shouldPublishReceipt(
+        hasReceivedSamples: Bool,
+        sampleCount: Int
+    ) -> Bool {
+        sampleCount > 0 && !hasReceivedSamples
+    }
+}
+
+struct AudioRecoveryCoalescingState {
+    private(set) var pendingEventCount = 0
+
+    mutating func recordEvent() {
+        pendingEventCount += 1
+    }
+
+    mutating func consumePendingEventCount() -> Int {
+        let count = pendingEventCount
+        pendingEventCount = 0
+        return count
+    }
+
+    mutating func reset() {
+        pendingEventCount = 0
+    }
+}
+
+struct BluetoothVoiceTailSnapshot: Equatable {
+    let sampleCount: Int
+    let durationMilliseconds: Int
+    let nonZeroSampleCount: Int
+    let peak: Int
+    let rms: Int
+    let finalWindowSampleCount: Int
+    let finalWindowDurationMilliseconds: Int
+    let finalWindowNonZeroSampleCount: Int
+    let finalWindowPeak: Int
+    let finalWindowRMS: Int
+    let lastAudioAgeMilliseconds: Int?
+}
+
+struct BluetoothVoiceTailDiagnostics {
+    static let sampleRate = 16_000
+    static let maximumSampleCount = 4_800
+
+    private var recentSamples: [Int16] = []
+    private var lastAudioUptime: TimeInterval?
+
+    mutating func reset() {
+        recentSamples.removeAll(keepingCapacity: true)
+        lastAudioUptime = nil
+    }
+
+    mutating func append(_ samples: [Int16], at uptime: TimeInterval) {
+        guard !samples.isEmpty else { return }
+        lastAudioUptime = uptime
+        if samples.count >= Self.maximumSampleCount {
+            recentSamples = Array(samples.suffix(Self.maximumSampleCount))
+            return
+        }
+        let overflow = max(0, recentSamples.count + samples.count - Self.maximumSampleCount)
+        if overflow > 0 {
+            recentSamples.removeFirst(overflow)
+        }
+        recentSamples.append(contentsOf: samples)
+    }
+
+    func snapshot(at stopUptime: TimeInterval) -> BluetoothVoiceTailSnapshot {
+        var metrics = WatchBluetoothAudioSignalMetrics()
+        metrics.append(recentSamples)
+        let finalWindowSamples = Array(recentSamples.suffix(Self.sampleRate / 10))
+        var finalWindowMetrics = WatchBluetoothAudioSignalMetrics()
+        finalWindowMetrics.append(finalWindowSamples)
+        return BluetoothVoiceTailSnapshot(
+            sampleCount: metrics.sampleCount,
+            durationMilliseconds: metrics.sampleCount * 1_000 / Self.sampleRate,
+            nonZeroSampleCount: metrics.nonZeroSampleCount,
+            peak: metrics.peak,
+            rms: metrics.rms,
+            finalWindowSampleCount: finalWindowMetrics.sampleCount,
+            finalWindowDurationMilliseconds:
+                finalWindowMetrics.sampleCount * 1_000 / Self.sampleRate,
+            finalWindowNonZeroSampleCount: finalWindowMetrics.nonZeroSampleCount,
+            finalWindowPeak: finalWindowMetrics.peak,
+            finalWindowRMS: finalWindowMetrics.rms,
+            lastAudioAgeMilliseconds: lastAudioUptime.map {
+                max(0, Int(((stopUptime - $0) * 1_000).rounded()))
+            }
+        )
+    }
+}
+
+private enum RecordingPlaybackOperationError: Error {
+    case playerRejected
+}
+
+private enum RecordingPlaybackStage: String {
+    case resolveAsset = "resolve_asset"
+    case initializePlayer = "initialize_player"
+    case preparePlayer = "prepare_player"
+    case startPlayback = "start_playback"
+}
+
 final class BridgeAppModel: ObservableObject, XiaomiBluetoothBridgeDelegate {
     private static let longRecordingOpenTimeout: TimeInterval = 5
     private static let longRecordingCloseTimeout: TimeInterval = 2
+    private static let rc003VoiceExtensionOpenTimeout: TimeInterval = 5
+    private static let rc003VoiceExtensionInterval: TimeInterval = 8
+    private static let rc003VoiceExtensionMaximumDuration: TimeInterval = 120
 
     let settings: AppSettings
     let privateFeature: PrivateFeatureIntegration
     let macroFeature: MacroFeatureIntegration
+    let membershipFeature: MembershipFeatureIntegration
+    let loginItemService: LoginItemService
 
     @Published private(set) var connectionStatus = LocalizedMessage("bluetooth.status.initializing")
     @Published private(set) var hidStatus = LocalizedMessage("button_mapping.status.disabled")
@@ -168,7 +336,7 @@ final class BridgeAppModel: ObservableObject, XiaomiBluetoothBridgeDelegate {
     @Published private(set) var testToneStatus = LocalizedMessage("audio.output.none_selected")
     @Published private(set) var isPlayingTestTone = false
     @Published private(set) var isAudioOutputReady = false
-    @Published private(set) var currentVoiceSampleCount: UInt64 = 0
+    @Published private(set) var hasReceivedCurrentVoiceSamples = false
     @Published private(set) var activeVoiceSource: UsageEventSource?
     @Published private(set) var lastMobileRemoteButtonObservation: MobileRemoteButtonObservation?
     @Published private(set) var isPhoneRemoteConnectionEnabled = false
@@ -178,13 +346,21 @@ final class BridgeAppModel: ObservableObject, XiaomiBluetoothBridgeDelegate {
     @Published private(set) var webRemoteState: WebRemoteSessionState = .disabled
     @Published private(set) var voiceShortcutStatus = LocalizedMessage("voice_button.status.preparing")
     @Published private(set) var transcriptRecords: [TranscriptRecord] = []
+    @Published private(set) var recordingAssets: [RecordingAssetManifest] = []
+    @Published private(set) var recordingPlaybackError: RecordingPlaybackFailure?
 
     private let transcriptArchiveStore: TranscriptArchiveStore
+    private let recordingAssetStore: RecordingAssetStore
     private let transcriptArchiveOperationQueue = DispatchQueue(
         label: "RemoteMic.transcriptArchive.operations",
         qos: .utility
     )
+    private let recordingPlaybackDiagnosticQueue = DispatchQueue(
+        label: "RemoteMic.recordingPlayback.diagnostics",
+        qos: .utility
+    )
     private let audioOutput = VirtualAudioOutput()
+    private var recordingPlayback: AVAudioPlayer?
     private let phoneRemoteServer = PhoneRemoteServer(logger: { message in
         AppLogger.shared.write(message)
     })
@@ -209,7 +385,7 @@ final class BridgeAppModel: ObservableObject, XiaomiBluetoothBridgeDelegate {
         },
         setFunctionKeyPressed: { KeyboardInjector.setFunctionKeyPressed($0) },
         enqueueAudio: { [weak self] samples in
-            _ = self?.audioOutput.enqueue(samples: samples)
+            self?.enqueueVoiceFnTapAudio(samples)
         },
         drainAudio: { [weak self] completion in
             guard let self else {
@@ -224,16 +400,33 @@ final class BridgeAppModel: ObservableObject, XiaomiBluetoothBridgeDelegate {
     )
     private lazy var transcriptCaptureCoordinator = TranscriptCaptureCoordinator(
         isEnabled: { [weak self] in
-            self?.settings.localTranscriptHistoryEnabled ?? false
+            guard let self else { return false }
+            return self.settings.localTranscriptHistoryEnabled
+                || self.settings.localOriginalAudioRecordingEnabled
         },
         onCapture: { [weak self] capture in
             self?.archiveCapturedTranscript(capture)
         }
     )
+    private lazy var recordingAssetCoordinator = RecordingAssetCoordinator(
+        store: recordingAssetStore,
+        isEnabled: { [weak self] in
+            self?.settings.localOriginalAudioRecordingEnabled ?? false
+        },
+        onCommit: { [weak self] _ in
+            self?.refreshRecordingAssets()
+        }
+    )
     private var transcriptHistoryToggleCancellable: AnyCancellable?
+    private var recordingToggleCancellable: AnyCancellable?
+    private var membershipAccessCancellable: AnyCancellable?
     private var testToneGeneration = 0
-    private var phoneVoiceFunctionKeyLatch = VoiceFunctionKeyLatch()
+    private var voiceKeyLatch = VoiceFunctionKeyLatch()
+    private var heldVoiceKeyMode: VoiceKeyMode?
     private var voiceSessionStartedAt: Date?
+    private var voiceSessionID: UUID?
+    private var voiceAudioDeliveryGeneration = 0
+    private var voiceAudioDeliveryDiagnostic = VoiceAudioDeliveryDiagnostic()
     private var voiceSessionUsageSource: UsageEventSource?
     private var bluetoothVoiceActive = false
     private var loggedBluetoothVoiceAudioDeviceIdentifier: UUID?
@@ -253,6 +446,15 @@ final class BridgeAppModel: ObservableObject, XiaomiBluetoothBridgeDelegate {
     private var longRecordingGeneration: UInt64 = 0
     private var longRecordingOpenTimer: DispatchSourceTimer?
     private var longRecordingCloseTimer: DispatchSourceTimer?
+    private let rc003VoiceExtensionTestEnabled: Bool
+    private weak var rc003VoiceExtensionBridge: XiaomiBluetoothBridge?
+    private var rc003VoiceExtensionActive = false
+    private var rc003VoiceExtensionAwaitingReopen = false
+    private var rc003VoiceExtensionGeneration: UInt64 = 0
+    private var rc003VoiceExtensionDidReceiveAudio = false
+    private var rc003VoiceExtensionTimer: DispatchSourceTimer?
+    private var rc003VoiceExtensionOpenTimer: DispatchSourceTimer?
+    private var rc003VoiceExtensionDeadlineTimer: DispatchSourceTimer?
     private var phoneApprovalAlert: NSAlert?
     private var webApprovalAlert: NSAlert?
     private var remoteButtonTitles: [String: String] = [:]
@@ -271,14 +473,19 @@ final class BridgeAppModel: ObservableObject, XiaomiBluetoothBridgeDelegate {
     private var bluetoothVoiceDecodedSampleCount = 0
     private var bluetoothVoiceEnqueueFailureCount = 0
     private var bluetoothVoiceTraceRoute = "none"
+    private var bluetoothVoiceTailDiagnostics = BluetoothVoiceTailDiagnostics()
     private let hidEventSuppressor = KeyboardEventSuppressor()
     private var hidMonitors: [String: HIDRemoteMonitor] = [:]
     private var discoveryHIDMonitor: HIDRemoteMonitor?
     private var hidPowerKeySuppressed = false
     private var hidAllowedLocationIDs: Set<UInt32>?
     private var started = false
+    private var appliedHIDPermissionSnapshot: HIDPermissionSnapshot?
     private var terminationObserver: NSObjectProtocol?
     private var completedUpdateHIDRecoveryWorkItem: DispatchWorkItem?
+    private var hidMappingRecoveryWorkItem: DispatchWorkItem?
+    private var hidMappingRecoveryAttempt = 0
+    private var hidMappingRecoveryGeneration: UInt64 = 0
     private let audioPreparationQueue = DispatchQueue(label: "RemoteMic.audioPreparation", qos: .userInitiated)
     private var audioStartupGeneration: UInt64 = 0
     private var audioDeviceRefreshGeneration: UInt64 = 0
@@ -287,6 +494,7 @@ final class BridgeAppModel: ObservableObject, XiaomiBluetoothBridgeDelegate {
     private var observedAudioHardwareAddresses: [AudioObjectPropertyAddress] = []
     private var audioRecoveryWorkItem: DispatchWorkItem?
     private var audioRecoveryGeneration: UInt64 = 0
+    private var audioRecoveryCoalescingState = AudioRecoveryCoalescingState()
     private var virtualAudioReleaseGeneration: UInt64 = 0
     private var pendingVirtualAudioRelease: (generation: UInt64, reason: String)?
     private var systemAudioSuspensionState = SystemAudioSuspensionState()
@@ -296,18 +504,37 @@ final class BridgeAppModel: ObservableObject, XiaomiBluetoothBridgeDelegate {
         self?.scheduleAudioRecovery(reason: "hardware_change", details: "properties=\(properties)")
     }
 
+    var isRC003VoiceExtensionTestEnabled: Bool {
+        rc003VoiceExtensionTestEnabled
+    }
+
     init(
         settings: AppSettings = AppSettings(),
         initialAudioDevices: [AudioDeviceInfo] = [],
         privateFeature: PrivateFeatureIntegration = PrivateFeatureIntegration(),
         macroFeature: MacroFeatureIntegration = MacroFeatureIntegration(),
-        transcriptArchiveStore: TranscriptArchiveStore = TranscriptArchiveStore()
+        membershipFeature: MembershipFeatureIntegration = MembershipFeatureIntegration(),
+        loginItemService: LoginItemService = LoginItemService(),
+        transcriptArchiveStore: TranscriptArchiveStore = TranscriptArchiveStore(),
+        rc003VoiceExtensionTestEnabled: Bool =
+            ProcessInfo.processInfo.arguments.contains("--rc003-voice-extension-test") ||
+            (Bundle.main.object(forInfoDictionaryKey: "RC003VoiceExtensionTestEnabled") as? Bool == true),
+        recordingAssetStore: RecordingAssetStore = RecordingAssetStore()
     ) {
         self.settings = settings
         self.privateFeature = privateFeature
         self.macroFeature = macroFeature
+        self.membershipFeature = membershipFeature
+        self.loginItemService = loginItemService
         self.transcriptArchiveStore = transcriptArchiveStore
+        self.rc003VoiceExtensionTestEnabled = rc003VoiceExtensionTestEnabled
+        self.recordingAssetStore = recordingAssetStore
         audioDevices = initialAudioDevices
+        membershipAccessCancellable = membershipFeature.$buttonProfilesAccessDecision
+            .removeDuplicates()
+            .sink { [weak macroFeature] decision in
+                macroFeature?.updateButtonProfilesAccess(decision)
+            }
         audioOutput.onConfigurationChange = { [weak self] in
             self?.scheduleAudioRecovery(reason: "engine_configuration_change")
         }
@@ -547,7 +774,7 @@ final class BridgeAppModel: ObservableObject, XiaomiBluetoothBridgeDelegate {
             .removeDuplicates()
             .sink { [weak self] isEnabled in
                 guard let self else { return }
-                if isEnabled {
+                if isEnabled || self.settings.localOriginalAudioRecordingEnabled {
                     refreshTranscriptRecords()
                 } else {
                     transcriptCaptureCoordinator.cancel()
@@ -570,7 +797,9 @@ final class BridgeAppModel: ObservableObject, XiaomiBluetoothBridgeDelegate {
         let version = Bundle.main.object(
             forInfoDictionaryKey: "CFBundleShortVersionString"
         ) as? String ?? "development"
-        AppLogger.shared.write("APP START version=\(version)")
+        AppLogger.shared.write(
+            "APP START version=\(version) rc003_test=\(rc003VoiceExtensionTestEnabled)"
+        )
     }
 
     func stop() {
@@ -578,8 +807,11 @@ final class BridgeAppModel: ObservableObject, XiaomiBluetoothBridgeDelegate {
         macroFeature.stop()
         preferredInputSourceMonitor.stop()
         transcriptCaptureCoordinator.cancel()
+        recordingAssetCoordinator.cancel(reason: "app_stop")
+        stopRecordingPlayback()
         guard started else { return }
         started = false
+        cancelHIDMappingRecovery(reason: "app_stop")
         completedUpdateHIDRecoveryWorkItem?.cancel()
         completedUpdateHIDRecoveryWorkItem = nil
         audioStartupGeneration &+= 1
@@ -589,12 +821,14 @@ final class BridgeAppModel: ObservableObject, XiaomiBluetoothBridgeDelegate {
         audioRecoveryGeneration &+= 1
         audioRecoveryWorkItem?.cancel()
         audioRecoveryWorkItem = nil
+        audioRecoveryCoalescingState.reset()
         stopObservingAudioHardware()
         cancelTestToneIfNeeded(
             statusMessage: LocalizedMessage("app.status.stopped"),
             logReason: "app_stop"
         )
         stopLongRecording(reason: "app_stop")
+        finishRC003VoiceExtensionTest(reason: "app_stop")
         voiceInputDestinationCoordinator.shutdown()
         voiceFnTapSession.shutdown()
         bluetoothBridges.values.forEach { $0.stop() }
@@ -618,7 +852,7 @@ final class BridgeAppModel: ObservableObject, XiaomiBluetoothBridgeDelegate {
             completion?(.unavailable)
         }
         voiceSessionUsageSource = nil
-        updatePhoneVoiceFunctionKeyState(streaming: false)
+        releaseVoiceKeyIfNeeded()
         stopHIDMonitors()
         isAudioOutputReady = false
         virtualAudioReleaseGeneration &+= 1
@@ -648,7 +882,180 @@ final class BridgeAppModel: ObservableObject, XiaomiBluetoothBridgeDelegate {
                     self?.transcriptRecords = records
                 }
             } catch {
-                AppLogger.shared.write("TRANSCRIPT ARCHIVE load_failed")
+                AppLogger.shared.write(
+                    "TRANSCRIPT ARCHIVE load_failed reason=load_all " +
+                        AppLogger.errorFields(error)
+                )
+            }
+        }
+        refreshRecordingAssets()
+        recordingToggleCancellable = settings.$localOriginalAudioRecordingEnabled
+            .removeDuplicates()
+            .sink { [weak self] isEnabled in
+                guard let self else { return }
+                if !isEnabled {
+                    self.recordingAssetCoordinator.cancel(reason: "feature_disabled")
+                }
+                self.refreshRecordingAssets()
+            }
+    }
+
+    func refreshRecordingAssets() {
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            guard let self else { return }
+            do {
+                let assets = try self.recordingAssetStore.loadAll()
+                DispatchQueue.main.async { [weak self] in
+                    self?.recordingAssets = assets
+                }
+            } catch {
+                AppLogger.shared.write(
+                    "RECORDING ASSET load_failed reason=load_all " +
+                        AppLogger.errorFields(error)
+                )
+            }
+        }
+    }
+
+    func playRecording(_ asset: RecordingAssetManifest) {
+        recordingPlaybackError = nil
+        var stage = RecordingPlaybackStage.resolveAsset
+        var prepareResult: Bool?
+        do {
+            let url = try recordingAssetStore.mediaURL(for: asset)
+            recordingPlayback?.stop()
+            recordingPlayback = nil
+            stage = .initializePlayer
+            recordingPlayback = try AVAudioPlayer(contentsOf: url)
+            stage = .preparePlayer
+            prepareResult = recordingPlayback?.prepareToPlay()
+            stage = .startPlayback
+            guard recordingPlayback?.play() == true else {
+                throw RecordingPlaybackOperationError.playerRejected
+            }
+        } catch {
+            let playerDurationMilliseconds = recordingPlayback.map {
+                Int(($0.duration * 1_000).rounded())
+            } ?? -1
+            let playerChannelCount = recordingPlayback?.numberOfChannels ?? -1
+            let playerSampleRate = recordingPlayback.map {
+                Int($0.format.sampleRate.rounded())
+            } ?? -1
+            recordingPlayback?.stop()
+            recordingPlayback = nil
+            let failure: RecordingPlaybackFailure = error is RecordingPlaybackOperationError
+                ? .playerUnavailable
+                : .classify(error)
+            recordingPlaybackError = failure
+            let failureFields = [
+                "RECORDING ASSET playback_failed",
+                "record_id=\(asset.id.uuidString)",
+                "session_id=\(asset.sessionID.uuidString)",
+                "application_key=\(AppLogger.stableToken(asset.applicationKey ?? "__unknown__"))",
+                "date=\(asset.localDateKey)",
+                "reason=\(failure.logReason)",
+                "stage=\(stage.rawValue)",
+                "source=\(asset.source.rawValue)",
+                "manifest_format_supported=\(asset.format == "m4a-aac")",
+                "manifest_bytes=\(asset.byteCount)",
+                "manifest_duration_ms=\(asset.durationMilliseconds)",
+                "prepare_result=\(prepareResult.map { String($0) } ?? "not_attempted")",
+                "player_duration_ms=\(playerDurationMilliseconds)",
+                "player_channels=\(playerChannelCount)",
+                "player_sample_rate_hz=\(playerSampleRate)",
+                AppLogger.errorFields(error)
+            ]
+            AppLogger.shared.write(failureFields.joined(separator: " "))
+            logRecordingPlaybackIntegrity(asset)
+        }
+    }
+
+    private func logRecordingPlaybackIntegrity(_ asset: RecordingAssetManifest) {
+        recordingPlaybackDiagnosticQueue.async { [weak self] in
+            guard let self else { return }
+            do {
+                let diagnostics = try self.recordingAssetStore.integrityDiagnostics(for: asset)
+                AppLogger.shared.write(
+                    "RECORDING ASSET playback_integrity " +
+                        "record_id=\(asset.id.uuidString) " +
+                        "session_id=\(asset.sessionID.uuidString) " +
+                        "actual_bytes=\(diagnostics.actualByteCount) " +
+                        "byte_count_match=\(diagnostics.byteCountMatches) " +
+                        "sha256_match=\(diagnostics.sha256Matches)"
+                )
+            } catch {
+                AppLogger.shared.write(
+                    "RECORDING ASSET playback_integrity_failed " +
+                        "record_id=\(asset.id.uuidString) " +
+                        "session_id=\(asset.sessionID.uuidString) " +
+                        AppLogger.errorFields(error)
+                )
+            }
+        }
+    }
+
+    func clearRecordingPlaybackError() {
+        recordingPlaybackError = nil
+    }
+
+    func stopRecordingPlayback() {
+        recordingPlayback?.stop()
+        recordingPlayback = nil
+    }
+
+    func exportRecording(_ asset: RecordingAssetManifest) {
+        guard let sourceURL = try? recordingAssetStore.mediaURL(for: asset) else { return }
+        let panel = NSSavePanel()
+        panel.nameFieldStringValue = "回眸-\(asset.localDateKey).m4a"
+        panel.allowedFileTypes = ["m4a"]
+        panel.begin { response in
+            guard response == .OK, let destinationURL = panel.url else { return }
+            do {
+                if FileManager.default.fileExists(atPath: destinationURL.path) {
+                    try FileManager.default.trashItem(at: destinationURL, resultingItemURL: nil)
+                }
+                try FileManager.default.copyItem(at: sourceURL, to: destinationURL)
+            } catch {
+                AppLogger.shared.write("RECORDING ASSET export_failed")
+            }
+        }
+    }
+
+    func deleteRecording(_ asset: RecordingAssetManifest) {
+        stopRecordingPlayback()
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            guard let self else { return }
+            do {
+                try self.recordingAssetStore.delete(id: asset.id)
+                self.refreshRecordingAssets()
+            } catch {
+                AppLogger.shared.write("RECORDING ASSET delete_failed")
+            }
+        }
+    }
+
+    func deleteRecordingApplication(applicationKey: String) {
+        stopRecordingPlayback()
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            guard let self else { return }
+            do {
+                try self.recordingAssetStore.deleteApplication(applicationKey: applicationKey)
+                self.refreshRecordingAssets()
+            } catch {
+                AppLogger.shared.write("RECORDING ASSET delete_application_failed")
+            }
+        }
+    }
+
+    func deleteAllRecordings() {
+        stopRecordingPlayback()
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            guard let self else { return }
+            do {
+                try self.recordingAssetStore.deleteAll()
+                self.refreshRecordingAssets()
+            } catch {
+                AppLogger.shared.write("RECORDING ASSET delete_all_failed")
             }
         }
     }
@@ -685,6 +1092,50 @@ final class BridgeAppModel: ObservableObject, XiaomiBluetoothBridgeDelegate {
         completedUpdate && customMappingEnabled
     }
 
+    static func shouldReapplyHIDSettings(
+        previousState: BluetoothBridgeState?,
+        currentState: BluetoothBridgeState
+    ) -> Bool {
+        guard case .ready = currentState else { return false }
+        guard let previousState else { return true }
+        if case .ready = previousState { return false }
+        return true
+    }
+
+    static func canStartBluetoothVoice(
+        mode: VoiceKeyMode,
+        voiceFnTapModeEnabled: Bool = false,
+        isVoiceKeyNeutralized: Bool
+    ) -> Bool {
+        (mode == .function && !voiceFnTapModeEnabled) || isVoiceKeyNeutralized
+    }
+
+    static func canFallbackVoiceKeyMode(
+        isStreaming: Bool,
+        allowVoiceKeyModeFallback: Bool
+    ) -> Bool {
+        !isStreaming && allowVoiceKeyModeFallback
+    }
+
+    @discardableResult
+    static func importConfiguration(
+        from data: Data,
+        into settings: AppSettings,
+        isStreaming: Bool,
+        releaseVoiceKey: () -> Bool
+    ) throws -> Bool {
+        let importedVoiceKeyConfiguration = try settings.voiceKeyConfigurationState(in: data)
+        let changesVoiceKeyConfiguration =
+            importedVoiceKeyConfiguration != settings.voiceKeyConfigurationState
+        if changesVoiceKeyConfiguration {
+            guard !isStreaming, releaseVoiceKey() else {
+                throw AppConfigurationError.unsafeVoiceKeyChange
+            }
+        }
+        try settings.importConfiguration(from: data)
+        return changesVoiceKeyConfiguration
+    }
+
     func recoverHIDAfterCompletedUpdate(delay: TimeInterval = 2) {
         guard started, settings.customMappingEnabled else { return }
         completedUpdateHIDRecoveryWorkItem?.cancel()
@@ -700,6 +1151,27 @@ final class BridgeAppModel: ObservableObject, XiaomiBluetoothBridgeDelegate {
         DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: workItem)
     }
 
+    func refreshHIDAfterPermissionChange() {
+        let current = HIDPermissionSnapshot.current
+        guard HIDPermissionRecoveryPolicy.shouldReapplySettings(
+            started: started,
+            customMappingEnabled: settings.customMappingEnabled,
+            voiceKeyMode: settings.voiceKeyMode,
+            voiceFnTapModeEnabled: settings.voiceFnTapModeEnabled,
+            softwareVoiceKeyHeld: voiceKeyLatch.isHeld,
+            previous: appliedHIDPermissionSnapshot,
+            current: current
+        ) else { return }
+        let previous = appliedHIDPermissionSnapshot
+        AppLogger.shared.write(
+            "HID PERMISSIONS changed " +
+                "input=\(previous?.inputMonitoringGranted ?? false)->\(current.inputMonitoringGranted) " +
+                "accessibility=\(previous?.accessibilityGranted ?? false)->\(current.accessibilityGranted) " +
+                "recovery=apply_settings"
+        )
+        applyHIDSettings()
+    }
+
     func reconnect() {
         guard started else { return }
         if bluetoothBridges.isEmpty && discoveryBluetoothBridge == nil {
@@ -713,6 +1185,27 @@ final class BridgeAppModel: ObservableObject, XiaomiBluetoothBridgeDelegate {
             bluetoothBridges.values.forEach { $0.reconnectNow() }
             discoveryBluetoothBridge?.reconnectNow()
         }
+    }
+
+    private func recoverBluetoothAfterSystemWake() {
+        let targets: [XiaomiBluetoothBridge]
+        if let selectedBluetoothBridge {
+            targets = [selectedBluetoothBridge]
+        } else {
+            targets = Array(bluetoothBridges.values)
+        }
+        AppLogger.shared.write(
+            "BLE WAKE recovery_begin target_bridges=\(targets.count) " +
+                "discovery=\(discoveryBluetoothBridge != nil) " +
+                "ready_bridges=\(readyBluetoothBridgeCount)"
+        )
+        if targets.isEmpty, discoveryBluetoothBridge == nil {
+            startBluetoothConnections()
+            AppLogger.shared.write("BLE WAKE recovery_started_missing_bridges")
+            return
+        }
+        targets.forEach { $0.recoverAfterSystemWake() }
+        discoveryBluetoothBridge?.recoverAfterSystemWake()
     }
 
     func refreshRemoteDiscovery() {
@@ -980,6 +1473,9 @@ final class BridgeAppModel: ObservableObject, XiaomiBluetoothBridgeDelegate {
             return
         }
         resumeVirtualAudioOutputIfNeeded(reason: "system_\(event.rawValue)")
+        if BluetoothWakeRecoveryPolicy.shouldForceReconnect(event: event, started: started) {
+            recoverBluetoothAfterSystemWake()
+        }
     }
 
     @discardableResult
@@ -999,6 +1495,7 @@ final class BridgeAppModel: ObservableObject, XiaomiBluetoothBridgeDelegate {
             : LocalizedMessage("audio.output.none_or_unavailable")
         AppLogger.shared.write(
             "AUDIO REBIND finished reason=\(reason) success=\(configured) status=\(audioStatus.key) " +
+                "ready=\(isAudioOutputReady) selected_available=\(selectedAudioDeviceIsAvailable) " +
                 "state={\(audioOutput.diagnosticState())}"
         )
         if configured {
@@ -1010,7 +1507,12 @@ final class BridgeAppModel: ObservableObject, XiaomiBluetoothBridgeDelegate {
     @discardableResult
     private func ensureVirtualAudioOutputReady(reason: String) -> Bool {
         isAudioOutputReady = audioOutput.isReadyForTestTone
-        guard !isAudioOutputReady else { return true }
+        guard !isAudioOutputReady else {
+            AppLogger.shared.write(
+                "AUDIO HEALTH ready reason=\(reason) state={\(audioOutput.diagnosticState())}"
+            )
+            return true
+        }
         AppLogger.shared.write(
             "AUDIO HEALTH stale reason=\(reason) state={\(audioOutput.diagnosticState())}"
         )
@@ -1039,7 +1541,10 @@ final class BridgeAppModel: ObservableObject, XiaomiBluetoothBridgeDelegate {
             if result == noErr {
                 observedAudioHardwareAddresses.append(address)
             } else {
-                AppLogger.shared.write("AUDIO RECOVERY listener_failed selector=\(selector) error=\(result)")
+                AppLogger.shared.write(
+                    "AUDIO RECOVERY listener_failed selector=\(selector) " +
+                        AppLogger.errorFields(domain: "os_status", code: Int(result))
+                )
             }
         }
         AppLogger.shared.write("AUDIO ROUTE_MONITOR started properties=\(Self.audioHardwarePropertyNames(for: observedAudioHardwareAddresses))")
@@ -1074,6 +1579,18 @@ final class BridgeAppModel: ObservableObject, XiaomiBluetoothBridgeDelegate {
                 )
                 return
             }
+            let configurationHealthy = self.audioOutput.isConfigurationHealthyForDiagnostics
+            guard !VirtualAudioRecoveryPolicy.shouldIgnoreDefaultSystemOutputChange(
+                details: details,
+                configurationHealthy: configurationHealthy
+            ) else {
+                self.refreshAudioDevices()
+                AppLogger.shared.write(
+                    "AUDIO RECOVERY ignored reason=\(reason) detail=\(details) " +
+                        "explicit_output_healthy=true state={\(self.audioOutput.diagnosticState())}"
+                )
+                return
+            }
             guard self.shouldKeepVirtualAudioActive else {
                 self.refreshAudioDevices()
                 AppLogger.shared.write(
@@ -1081,17 +1598,19 @@ final class BridgeAppModel: ObservableObject, XiaomiBluetoothBridgeDelegate {
                 )
                 return
             }
+            self.audioRecoveryCoalescingState.recordEvent()
             self.audioRecoveryGeneration &+= 1
             let generation = self.audioRecoveryGeneration
-            let replacedPendingRecovery = self.audioRecoveryWorkItem != nil
             self.audioRecoveryWorkItem?.cancel()
             let work = DispatchWorkItem { [weak self] in
                 guard let self,
                       self.started,
                       self.audioRecoveryGeneration == generation
                 else { return }
+                let coalescedEvents = self.audioRecoveryCoalescingState.consumePendingEventCount()
                 AppLogger.shared.write(
                     "AUDIO RECOVERY begin id=\(generation) reason=\(reason) detail=\(details) " +
+                        "coalesced_events=\(coalescedEvents) " +
                         "state={\(self.audioOutput.diagnosticState())}"
                 )
                 self.refreshAudioDevices()
@@ -1104,10 +1623,6 @@ final class BridgeAppModel: ObservableObject, XiaomiBluetoothBridgeDelegate {
             }
             self.audioRecoveryWorkItem = work
             DispatchQueue.main.asyncAfter(deadline: .now() + 1, execute: work)
-            AppLogger.shared.write(
-                "AUDIO RECOVERY scheduled id=\(generation) reason=\(reason) detail=\(details) " +
-                    "replaced_pending=\(replacedPendingRecovery) state={\(self.audioOutput.diagnosticState())}"
-            )
         }
     }
 
@@ -1210,11 +1725,19 @@ final class BridgeAppModel: ObservableObject, XiaomiBluetoothBridgeDelegate {
         AppLogger.shared.write("AUDIO TEST_TONE cancelled reason=\(logReason)")
     }
 
-    func applyHIDSettings() {
-        if started, HIDRemoteMonitor.isInputMonitoringGranted {
+    func applyHIDSettings(allowVoiceKeyModeFallback: Bool = true) {
+        let permissionSnapshot = HIDPermissionSnapshot.current
+        appliedHIDPermissionSnapshot = permissionSnapshot
+        if !permissionSnapshot.accessibilityGranted {
+            _ = releaseVoiceKeyIfNeeded()
+        }
+        if started, permissionSnapshot.inputMonitoringGranted {
             preferredInputSourceMonitor.start()
         } else {
-            preferredInputSourceMonitor.stop()
+            preferredInputSourceMonitor.stop(
+                preservingExplicitVoiceSession:
+                    voiceKeyLatch.isHeld && heldVoiceKeyMode?.requiresAccessibility == true
+            )
         }
         if !settings.customMappingEnabled {
             stopLongRecording(reason: "mapping_disabled")
@@ -1223,23 +1746,100 @@ final class BridgeAppModel: ObservableObject, XiaomiBluetoothBridgeDelegate {
             stopLongRecording(reason: "feature_disabled")
         }
 
-        let requestedFnTapMode = settings.voiceFnTapModeEnabled
+        let requestedVoiceKeyMode = settings.voiceKeyMode
+        let accessibilityGranted = KeyboardInjector.isAccessibilityTrusted
+        let requestedFnTapMode = settings.voiceFnTapModeEnabled && requestedVoiceKeyMode == .function
+        if settings.voiceFnTapModeEnabled != requestedFnTapMode {
+            settings.voiceFnTapModeEnabled = requestedFnTapMode
+        }
         if !requestedFnTapMode, voiceFnTapSession.requiresCleanupBeforeMapping {
             voiceFnTapSession.setEnabled(false) { [weak self] in
-                self?.applyHIDSettings()
+                self?.applyHIDSettings(
+                    allowVoiceKeyModeFallback: allowVoiceKeyModeFallback
+                )
             }
             return
         }
-        requestNextHIDPermissionIfNeeded(voiceFnTapModeRequested: requestedFnTapMode)
+        requestNextHIDPermissionIfNeeded(
+            voiceFnTapModeRequested: requestedFnTapMode,
+            voiceKeyModeRequested: requestedVoiceKeyMode
+        )
+        let canFallbackVoiceKeyMode = Self.canFallbackVoiceKeyMode(
+            isStreaming: isStreaming,
+            allowVoiceKeyModeFallback: allowVoiceKeyModeFallback
+        )
         var powerKeySuppressed: Bool
-        if requestedFnTapMode, KeyboardInjector.isAccessibilityTrusted {
+        if requestedFnTapMode, accessibilityGranted {
             powerKeySuppressed = applyVoiceFunctionMapping(neutralizeVoiceKey: true)
             if voiceFunctionMapper.isVoiceKeyNeutralized {
                 voiceFnTapSession.setEnabled(true)
+            } else if !canFallbackVoiceKeyMode, isStreaming {
+                AppLogger.shared.write(
+                    "VOICE FN TAP mode_preserved reason=voice_active_mapping_failed"
+                )
+            } else if !canFallbackVoiceKeyMode {
+                AppLogger.shared.write(
+                    "VOICE FN TAP mode_preserved reason=voice_start_mapping_failed"
+                )
+            } else if HIDMappingRecoveryPolicy.shouldPreserveFnTapPreferenceAfterMappingFailure(
+                hasMatchingServices: voiceFunctionMapper.hasMatchingServices
+            ) {
+                voiceFnTapSession.setEnabled(false)
+                AppLogger.shared.write(
+                    "VOICE FN TAP mode_pending_mapping reason=no_matching_service"
+                )
+                scheduleHIDMappingRecoveryIfNeeded()
             } else {
                 settings.voiceFnTapModeEnabled = false
                 voiceFnTapSession.setEnabled(false)
                 powerKeySuppressed = applyVoiceFunctionMapping(neutralizeVoiceKey: false)
+            }
+        } else if requestedVoiceKeyMode != .function {
+            powerKeySuppressed = applyVoiceFunctionMapping(neutralizeVoiceKey: true)
+            if !voiceFunctionMapper.isVoiceKeyNeutralized {
+                if voiceFunctionMapper.hasMatchingServices {
+                    if isStreaming {
+                        voiceShortcutStatus = LocalizedMessage("voice_button.status.waiting")
+                        AppLogger.shared.write(
+                            "VOICE KEY mode_preserved reason=voice_active_mapping_failed " +
+                                "mode=\(requestedVoiceKeyMode.rawValue)"
+                        )
+                    } else if canFallbackVoiceKeyMode {
+                        settings.voiceKeyMode = .function
+                        powerKeySuppressed = applyVoiceFunctionMapping(neutralizeVoiceKey: false)
+                        AppLogger.shared.write(
+                            "VOICE KEY mode_fallback reason=voice_mapping_failed " +
+                                "mode=\(requestedVoiceKeyMode.rawValue)"
+                        )
+                    } else {
+                        voiceShortcutStatus = LocalizedMessage("voice_button.status.waiting")
+                        AppLogger.shared.write(
+                            "VOICE KEY mode_preserved reason=voice_start_mapping_failed " +
+                                "mode=\(requestedVoiceKeyMode.rawValue)"
+                        )
+                    }
+                } else if !accessibilityGranted {
+                    voiceShortcutStatus = LocalizedMessage(
+                        "connection.voice_key_mode.command_permission"
+                    )
+                    AppLogger.shared.write(
+                        "VOICE KEY mode_pending_permission_and_mapping " +
+                            "mode=\(requestedVoiceKeyMode.rawValue)"
+                    )
+                } else {
+                    voiceShortcutStatus = LocalizedMessage("voice_button.status.waiting")
+                    AppLogger.shared.write(
+                        "VOICE KEY mode_pending_mapping reason=no_matching_service " +
+                            "mode=\(requestedVoiceKeyMode.rawValue)"
+                    )
+                }
+            } else if !accessibilityGranted {
+                voiceShortcutStatus = LocalizedMessage(
+                    "connection.voice_key_mode.command_permission"
+                )
+                AppLogger.shared.write(
+                    "VOICE KEY mode_pending_permission mode=\(requestedVoiceKeyMode.rawValue)"
+                )
             }
         } else {
             if requestedFnTapMode {
@@ -1249,6 +1849,85 @@ final class BridgeAppModel: ObservableObject, XiaomiBluetoothBridgeDelegate {
             powerKeySuppressed = applyVoiceFunctionMapping(neutralizeVoiceKey: false)
         }
         startHIDMonitors(powerKeySuppressed: powerKeySuppressed)
+        completeHIDMappingRecoveryIfNeeded()
+    }
+
+    private func scheduleHIDMappingRecoveryIfNeeded() {
+        guard hidMappingRecoveryWorkItem == nil else { return }
+        guard let delay = HIDMappingRecoveryPolicy.retryDelay(
+            forAttempt: hidMappingRecoveryAttempt,
+            started: started,
+            readyBridgeCount: readyBluetoothBridgeCount,
+            hasMatchingServices: voiceFunctionMapper.hasMatchingServices
+        ) else {
+            if started,
+               readyBluetoothBridgeCount > 0,
+               !voiceFunctionMapper.hasMatchingServices,
+               hidMappingRecoveryAttempt == HIDMappingRecoveryPolicy.retryDelays.count {
+                AppLogger.shared.write(
+                    "HID MAPPING RECOVERY exhausted attempts=\(hidMappingRecoveryAttempt) " +
+                        "ready_bridges=\(readyBluetoothBridgeCount)"
+                )
+            }
+            return
+        }
+
+        let attempt = hidMappingRecoveryAttempt + 1
+        hidMappingRecoveryAttempt = attempt
+        hidMappingRecoveryGeneration &+= 1
+        let generation = hidMappingRecoveryGeneration
+        let workItem = DispatchWorkItem { [weak self] in
+            guard let self, self.hidMappingRecoveryGeneration == generation else { return }
+            self.hidMappingRecoveryWorkItem = nil
+            guard self.started,
+                  self.readyBluetoothBridgeCount > 0,
+                  !self.voiceFunctionMapper.hasMatchingServices
+            else {
+                self.cancelHIDMappingRecovery(reason: "conditions_changed")
+                return
+            }
+            AppLogger.shared.write(
+                "HID MAPPING RECOVERY applying attempt=\(attempt) " +
+                    "ready_bridges=\(self.readyBluetoothBridgeCount)"
+            )
+            self.applyHIDSettings()
+            if !self.voiceFunctionMapper.hasMatchingServices {
+                self.scheduleHIDMappingRecoveryIfNeeded()
+            }
+        }
+        hidMappingRecoveryWorkItem = workItem
+        AppLogger.shared.write(
+            "HID MAPPING RECOVERY scheduled attempt=\(attempt) " +
+                "delay_ms=\(Int(delay * 1_000)) ready_bridges=\(readyBluetoothBridgeCount)"
+        )
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: workItem)
+    }
+
+    private func completeHIDMappingRecoveryIfNeeded() {
+        guard voiceFunctionMapper.hasMatchingServices,
+              hidMappingRecoveryWorkItem != nil || hidMappingRecoveryAttempt > 0
+        else { return }
+        let attempts = hidMappingRecoveryAttempt
+        hidMappingRecoveryGeneration &+= 1
+        hidMappingRecoveryWorkItem?.cancel()
+        hidMappingRecoveryWorkItem = nil
+        hidMappingRecoveryAttempt = 0
+        AppLogger.shared.write(
+            "HID MAPPING RECOVERY completed attempts=\(attempts) " +
+                "matched=\(voiceFunctionMapper.matchedServiceCount)"
+        )
+    }
+
+    private func cancelHIDMappingRecovery(reason: String) {
+        guard hidMappingRecoveryWorkItem != nil || hidMappingRecoveryAttempt > 0 else { return }
+        let attempts = hidMappingRecoveryAttempt
+        hidMappingRecoveryGeneration &+= 1
+        hidMappingRecoveryWorkItem?.cancel()
+        hidMappingRecoveryWorkItem = nil
+        hidMappingRecoveryAttempt = 0
+        AppLogger.shared.write(
+            "HID MAPPING RECOVERY cancelled reason=\(reason) attempts=\(attempts)"
+        )
     }
 
     private func startHIDMonitors(powerKeySuppressed: Bool) {
@@ -1319,7 +1998,7 @@ final class BridgeAppModel: ObservableObject, XiaomiBluetoothBridgeDelegate {
                 self?.performExternalConfiguredAction(configured) ?? false
             },
             overrideActionPerformer: { [weak self] profileID, button, trigger in
-                self?.macroFeature.executeBoundMacro(
+                self?.performButtonProfileBoundAction(
                     profileID: profileID,
                     button: button,
                     trigger: trigger
@@ -1352,7 +2031,8 @@ final class BridgeAppModel: ObservableObject, XiaomiBluetoothBridgeDelegate {
                 ?? self.settings.profileID(forHIDFingerprint: fingerprint)
             let resolvedProfileID = existingProfileID
                 ?? self.settings.registerHIDRemote(fingerprint: fingerprint)
-            if resolvedProfileID == self.settings.selectedRemoteProfileID {
+            if resolvedProfileID == self.settings.selectedRemoteProfileID,
+               self.macroFeature.isEditorActive {
                 self.macroFeature.noteButtonInteraction(button: button)
             }
             let isNewBinding = existingProfileID == nil
@@ -1369,6 +2049,11 @@ final class BridgeAppModel: ObservableObject, XiaomiBluetoothBridgeDelegate {
                 control: .remoteButton(button),
                 source: .bluetoothRemote
             )
+            if self.macroFeature.isEditorActive {
+                AppLogger.shared.write(
+                    "HID BUTTON button=\(button.rawValue) path=binding_editor_capture"
+                )
+            }
             return (resolvedProfileID, !self.macroFeature.isEditorActive)
         }
         monitor.onInternalAction = { [weak self] profileID, action in
@@ -1388,6 +2073,10 @@ final class BridgeAppModel: ObservableObject, XiaomiBluetoothBridgeDelegate {
     }
 
     func setVoiceFnTapModeEnabled(_ enabled: Bool) {
+        guard settings.voiceKeyMode == .function else {
+            settings.voiceFnTapModeEnabled = false
+            return
+        }
         if enabled {
             enableVoiceFnTapMode()
             return
@@ -1396,6 +2085,68 @@ final class BridgeAppModel: ObservableObject, XiaomiBluetoothBridgeDelegate {
         voiceFnTapSession.setEnabled(false) { [weak self] in
             self?.applyHIDSettings()
         }
+    }
+
+    func importConfiguration(from data: Data) throws {
+        let changedVoiceKeyConfiguration: Bool
+        do {
+            changedVoiceKeyConfiguration = try Self.importConfiguration(
+                from: data,
+                into: settings,
+                isStreaming: isStreaming,
+                releaseVoiceKey: { releaseVoiceKeyIfNeeded() }
+            )
+        } catch AppConfigurationError.unsafeVoiceKeyChange {
+            AppLogger.shared.write(
+                "CONFIGURATION IMPORT rejected reason=unsafe_voice_key_change"
+            )
+            throw AppConfigurationError.unsafeVoiceKeyChange
+        }
+        if changedVoiceKeyConfiguration {
+            preferredInputSourceMonitor.endVoiceSession()
+        }
+        applyAudioSettings(reason: "configuration_import")
+        applyHIDSettings()
+    }
+
+    func setVoiceKeyMode(_ mode: VoiceKeyMode) {
+        guard mode != settings.voiceKeyMode else { return }
+        let previousMode = settings.voiceKeyMode.rawValue
+        AppLogger.shared.write(
+            "VOICE KEY mode_change requested from=\(previousMode) to=\(mode.rawValue)"
+        )
+        guard !isStreaming else {
+            AppLogger.shared.write(
+                "VOICE KEY mode_change_rejected reason=voice_active requested=\(mode.rawValue)"
+            )
+            return
+        }
+
+        guard releaseVoiceKeyIfNeeded() else {
+            AppLogger.shared.write(
+                "VOICE KEY mode_change_rejected reason=release_failed requested=\(mode.rawValue)"
+            )
+            return
+        }
+        preferredInputSourceMonitor.endVoiceSession()
+        if mode != .function {
+            settings.voiceFnTapModeEnabled = false
+            voiceFnTapSession.setEnabled(false) { [weak self] in
+                guard let self else { return }
+                self.settings.voiceKeyMode = mode
+                self.applyHIDSettings()
+                AppLogger.shared.write(
+                    "VOICE KEY mode_change completed from=\(previousMode) to=\(mode.rawValue) result=applied"
+                )
+            }
+            return
+        }
+
+        settings.voiceKeyMode = .function
+        applyHIDSettings()
+        AppLogger.shared.write(
+            "VOICE KEY mode_change completed from=\(previousMode) to=fn result=applied"
+        )
     }
 
     private func enableVoiceFnTapMode() {
@@ -1408,8 +2159,19 @@ final class BridgeAppModel: ObservableObject, XiaomiBluetoothBridgeDelegate {
 
         var powerKeySuppressed = applyVoiceFunctionMapping(neutralizeVoiceKey: true)
         guard voiceFunctionMapper.isVoiceKeyNeutralized else {
-            settings.voiceFnTapModeEnabled = false
             voiceFnTapSession.setEnabled(false)
+            if HIDMappingRecoveryPolicy.shouldPreserveFnTapPreferenceAfterMappingFailure(
+                hasMatchingServices: voiceFunctionMapper.hasMatchingServices
+            ) {
+                settings.voiceFnTapModeEnabled = true
+                AppLogger.shared.write(
+                    "VOICE FN TAP mode_pending_mapping reason=no_matching_service"
+                )
+                startHIDMonitors(powerKeySuppressed: powerKeySuppressed)
+                scheduleHIDMappingRecoveryIfNeeded()
+                return
+            }
+            settings.voiceFnTapModeEnabled = false
             powerKeySuppressed = applyVoiceFunctionMapping(neutralizeVoiceKey: false)
             startHIDMonitors(powerKeySuppressed: powerKeySuppressed)
             return
@@ -1427,11 +2189,13 @@ final class BridgeAppModel: ObservableObject, XiaomiBluetoothBridgeDelegate {
     }
 
     private func requestNextHIDPermissionIfNeeded(
-        voiceFnTapModeRequested: Bool? = nil
+        voiceFnTapModeRequested: Bool? = nil,
+        voiceKeyModeRequested: VoiceKeyMode? = nil
     ) {
         let request = HIDPermissionGate.nextPermissionRequest(
             mappingEnabled: settings.customMappingEnabled,
             voiceFnTapModeEnabled: voiceFnTapModeRequested ?? settings.voiceFnTapModeEnabled,
+            voiceKeyMode: voiceKeyModeRequested ?? settings.voiceKeyMode,
             inputMonitoringGranted: HIDRemoteMonitor.isInputMonitoringGranted,
             accessibilityGranted: KeyboardInjector.isAccessibilityTrusted
         )
@@ -1577,18 +2341,24 @@ final class BridgeAppModel: ObservableObject, XiaomiBluetoothBridgeDelegate {
         _ bridge: XiaomiBluetoothBridge,
         didChange state: BluetoothBridgeState
     ) {
-        let hadReadyBridge = bluetoothBridgeStates.values.contains { existingState in
-            if case .ready = existingState { return true }
-            return false
-        }
-        bluetoothBridgeStates[ObjectIdentifier(bridge)] = state
+        let bridgeObjectID = ObjectIdentifier(bridge)
+        let previousState = bluetoothBridgeStates[bridgeObjectID]
+        let shouldReapplyHIDSettings = Self.shouldReapplyHIDSettings(
+            previousState: previousState,
+            currentState: state
+        )
+        bluetoothBridgeStates[bridgeObjectID] = state
         if case .ready = state {
             _ = registerBluetoothBridgeIfNeeded(bridge)
             voiceFnTapSession.resume()
-            if !hadReadyBridge {
+            if shouldReapplyHIDSettings {
                 applyHIDSettings()
+                scheduleHIDMappingRecoveryIfNeeded()
             }
         } else {
+            if readyBluetoothBridgeCount == 0 {
+                cancelHIDMappingRecovery(reason: "bluetooth_not_ready")
+            }
             let identifier = bluetoothIdentifier(for: bridge)
             if let identifier,
                let profileID = settings.profileID(forBluetoothIdentifier: identifier) {
@@ -1597,8 +2367,14 @@ final class BridgeAppModel: ObservableObject, XiaomiBluetoothBridgeDelegate {
             }
             let voiceWasActive = identifier == activeBluetoothVoiceDeviceIdentifier
             if voiceWasActive {
+                if rc003VoiceExtensionTestEnabled,
+                   rc003VoiceExtensionActive,
+                   rc003VoiceExtensionBridge === bridge {
+                    finishRC003VoiceExtensionTest(reason: "bluetooth_not_ready")
+                }
                 bluetoothVoiceActive = false
                 activeBluetoothVoiceDeviceIdentifier = nil
+                releaseVoiceKeyIfNeeded(owner: .bluetooth, forceSoftware: false)
                 endVoiceSessionIfNeeded(flushAudio: false)
             }
             if longRecordingRequested {
@@ -1627,11 +2403,30 @@ final class BridgeAppModel: ObservableObject, XiaomiBluetoothBridgeDelegate {
 
     func bluetoothBridgeDidStartVoice(_ bridge: XiaomiBluetoothBridge) {
         guard let identifier = bridge.deviceIdentifier else { return }
+        let isRC003Continuation = rc003VoiceExtensionTestEnabled &&
+            rc003VoiceExtensionActive &&
+            rc003VoiceExtensionAwaitingReopen &&
+            rc003VoiceExtensionBridge === bridge
         let profileID = activateRemoteProfile(for: bridge)
         if let activeBluetoothVoiceDeviceIdentifier,
            activeBluetoothVoiceDeviceIdentifier != identifier {
             _ = bridge.requestMicrophoneClose()
             AppLogger.shared.write("ATVV STREAM rejected_busy")
+            return
+        }
+        if settings.voiceKeyMode != .function || settings.voiceFnTapModeEnabled {
+            applyHIDSettings(allowVoiceKeyModeFallback: false)
+        }
+        guard Self.canStartBluetoothVoice(
+            mode: settings.voiceKeyMode,
+            voiceFnTapModeEnabled: settings.voiceFnTapModeEnabled,
+            isVoiceKeyNeutralized: voiceFunctionMapper.isVoiceKeyNeutralized
+        ) else {
+            _ = bridge.requestMicrophoneClose()
+            AppLogger.shared.write(
+                "ATVV STREAM rejected reason=voice_key_not_neutralized " +
+                    "mode=\(settings.voiceKeyMode.rawValue)"
+            )
             return
         }
         guard ensureVirtualAudioOutputReady(reason: "bluetooth_voice_start") else {
@@ -1642,6 +2437,19 @@ final class BridgeAppModel: ObservableObject, XiaomiBluetoothBridgeDelegate {
         activeBluetoothVoiceDeviceIdentifier = identifier
         loggedBluetoothVoiceAudioDeviceIdentifier = nil
         bluetoothVoiceActive = true
+        guard updateVoiceKeyState(
+            streaming: true,
+            forceSoftware: false,
+            owner: .bluetooth
+        ) else {
+            _ = bridge.requestMicrophoneClose()
+            bluetoothVoiceActive = false
+            activeBluetoothVoiceDeviceIdentifier = nil
+            AppLogger.shared.write(
+                "ATVV STREAM rejected reason=voice_key mode=\(settings.voiceKeyMode.rawValue)"
+            )
+            return
+        }
         let model = profileID
             .flatMap { id in settings.remoteDeviceProfiles.first(where: { $0.id == id })?.model }
             ?? .unknown
@@ -1651,9 +2459,10 @@ final class BridgeAppModel: ObservableObject, XiaomiBluetoothBridgeDelegate {
         bluetoothVoiceTraceModel = model
         bluetoothVoiceDecodedBatchCount = 0
         bluetoothVoiceDecodedSampleCount = 0
-        currentVoiceSampleCount = 0
+        resetCurrentVoiceSampleReceipt()
         bluetoothVoiceEnqueueFailureCount = 0
         bluetoothVoiceTraceRoute = "none"
+        bluetoothVoiceTailDiagnostics.reset()
         AppLogger.shared.write(
             "ATVV STREAM accepted trace=\(bluetoothVoiceTraceCounter) model=\(model.rawValue)"
         )
@@ -1671,15 +2480,63 @@ final class BridgeAppModel: ObservableObject, XiaomiBluetoothBridgeDelegate {
             longRecordingOpenTimer = nil
             AppLogger.shared.write("LONG RECORDING started")
         }
-        _ = voiceFnTapSession.startVoice()
-        beginVoiceSessionIfNeeded()
+        if isRC003Continuation {
+            rc003VoiceExtensionAwaitingReopen = false
+            rc003VoiceExtensionDidReceiveAudio = false
+            rc003VoiceExtensionOpenTimer?.cancel()
+            rc003VoiceExtensionOpenTimer = nil
+            AppLogger.shared.write(
+                "RC003 EXTENSION physical_segment_reopened trace=\(activeBluetoothVoiceTraceID ?? 0)"
+            )
+        } else {
+            _ = voiceFnTapSession.startVoice()
+            beginVoiceSessionIfNeeded()
+            if rc003VoiceExtensionTestEnabled {
+                rc003VoiceExtensionActive = true
+                rc003VoiceExtensionAwaitingReopen = false
+                rc003VoiceExtensionDidReceiveAudio = false
+                rc003VoiceExtensionBridge = bridge
+                rc003VoiceExtensionGeneration &+= 1
+                scheduleRC003VoiceExtensionDeadline(
+                    generation: rc003VoiceExtensionGeneration
+                )
+                AppLogger.shared.write(
+                    "RC003 EXTENSION test_started max_duration_s=\(Int(Self.rc003VoiceExtensionMaximumDuration))"
+                )
+            }
+        }
     }
 
     func bluetoothBridgeDidStopVoice(_ bridge: XiaomiBluetoothBridge) {
         guard bridge.deviceIdentifier == activeBluetoothVoiceDeviceIdentifier else { return }
+        if rc003VoiceExtensionTestEnabled,
+           rc003VoiceExtensionActive,
+           rc003VoiceExtensionBridge === bridge {
+            bluetoothVoiceActive = false
+            loggedBluetoothVoiceAudioDeviceIdentifier = nil
+            rc003VoiceExtensionAwaitingReopen = true
+            rc003VoiceExtensionDidReceiveAudio = false
+            rc003VoiceExtensionTimer?.cancel()
+            rc003VoiceExtensionTimer = nil
+            rc003VoiceExtensionGeneration &+= 1
+            let opened = bridge.requestMicrophoneOpen()
+            if opened {
+                scheduleRC003VoiceExtensionOpenTimeout(
+                    generation: rc003VoiceExtensionGeneration
+                )
+            } else {
+                finishRC003VoiceExtensionTest(reason: "reopen_rejected")
+            }
+            AppLogger.shared.write(
+                "RC003 EXTENSION physical_stop reopen_requested=\(opened) " +
+                    "generation=\(rc003VoiceExtensionGeneration)"
+            )
+            return
+        }
         activeBluetoothVoiceDeviceIdentifier = nil
         loggedBluetoothVoiceAudioDeviceIdentifier = nil
         bluetoothVoiceActive = false
+        releaseVoiceKeyIfNeeded(owner: .bluetooth, forceSoftware: false)
         if longRecordingRequested {
             finishLongRecording(reason: "remote_stop")
         } else if longRecordingCloseTimer != nil {
@@ -1688,27 +2545,47 @@ final class BridgeAppModel: ObservableObject, XiaomiBluetoothBridgeDelegate {
             AppLogger.shared.write("LONG RECORDING close_confirmed")
         }
         let handledByFnTapMode = voiceFnTapSession.stopVoice()
-        let shouldFlushAudio = BluetoothVoiceStopPolicy.shouldFlushAudio(
-            handledByFnTapMode: handledByFnTapMode
-        )
         let traceID = activeBluetoothVoiceTraceID ?? 0
         let durationMilliseconds = bluetoothVoiceTraceStartedAt.map {
             max(0, Int(Date().timeIntervalSince($0) * 1_000))
         } ?? 0
+        let shouldFlushAudio = BluetoothVoiceStopPolicy.shouldFlushAudio(
+            handledByFnTapMode: handledByFnTapMode
+        )
         let pendingBuffers = audioOutput.pendingVoiceBufferCountForDiagnostics
+        let tailSnapshot = bluetoothVoiceTailDiagnostics.snapshot(
+            at: ProcessInfo.processInfo.systemUptime
+        )
         AppLogger.shared.write(
             "ATVV STREAM summary trace=\(traceID) model=\(bluetoothVoiceTraceModel.rawValue) " +
                 "duration_ms=\(durationMilliseconds) batches=\(bluetoothVoiceDecodedBatchCount) " +
                 "samples=\(bluetoothVoiceDecodedSampleCount) " +
                 "enqueue_failures=\(bluetoothVoiceEnqueueFailureCount) " +
                 "route=\(bluetoothVoiceTraceRoute) pending_buffers=\(pendingBuffers) " +
-                "flush=\(shouldFlushAudio)"
+                "flush=\(shouldFlushAudio) audio_ready=\(audioOutput.isReadyForTestTone) " +
+                "audio_state={\(audioOutput.diagnosticState())}"
+        )
+        AppLogger.shared.write(
+            "ATVV STREAM tail trace=\(traceID) model=\(bluetoothVoiceTraceModel.rawValue) " +
+                "route=\(bluetoothVoiceTraceRoute) " +
+                "fn_pressed_at_stop=\(preferredInputSourceMonitor.functionKeyIsPressedForDiagnostics) " +
+                "last_audio_age_ms=\(tailSnapshot.lastAudioAgeMilliseconds.map(String.init) ?? "none") " +
+                "tail_ms=\(tailSnapshot.durationMilliseconds) " +
+                "tail_samples=\(tailSnapshot.sampleCount) " +
+                "tail_nonzero=\(tailSnapshot.nonZeroSampleCount) " +
+                "tail_peak=\(tailSnapshot.peak) tail_rms=\(tailSnapshot.rms) " +
+                "final_window_ms=\(tailSnapshot.finalWindowDurationMilliseconds) " +
+                "final_window_samples=\(tailSnapshot.finalWindowSampleCount) " +
+                "final_window_nonzero=\(tailSnapshot.finalWindowNonZeroSampleCount) " +
+                "final_window_peak=\(tailSnapshot.finalWindowPeak) " +
+                "final_window_rms=\(tailSnapshot.finalWindowRMS)"
         )
         audioOutput.logWhenPendingVoiceAudioDrains(
             context: "trace=\(traceID) model=\(bluetoothVoiceTraceModel.rawValue)"
         )
         activeBluetoothVoiceTraceID = nil
         bluetoothVoiceTraceStartedAt = nil
+        bluetoothVoiceTailDiagnostics.reset()
         endVoiceSessionIfNeeded(flushAudio: shouldFlushAudio)
         if systemAudioSuspensionState.isSuspended {
             releaseVirtualAudioOutputIfUnused(reason: "system_suspended_after_bluetooth_voice")
@@ -1719,11 +2596,30 @@ final class BridgeAppModel: ObservableObject, XiaomiBluetoothBridgeDelegate {
         guard let identifier = bridge.deviceIdentifier,
               identifier == activeBluetoothVoiceDeviceIdentifier
         else { return }
+        recordingAssetCoordinator.append(samples: samples)
+        let deliveryGeneration = voiceAudioDeliveryDiagnostic.generation
         let handledByFnTapMode = voiceFnTapSession.receive(samples)
-        let enqueued = handledByFnTapMode || audioOutput.enqueue(samples: samples)
+        let enqueued: Bool
+        if handledByFnTapMode {
+            enqueued = true
+        } else {
+            enqueued = audioOutput.enqueue(
+                samples: samples,
+                deliveryGeneration: deliveryGeneration
+            )
+            recordVoiceAudioEnqueueOutcome(
+                accepted: enqueued,
+                deliveryGeneration: deliveryGeneration
+            )
+        }
+        recordVoiceAudioReceipt(
+            samples: samples,
+            route: handledByFnTapMode ? .virtualAudioViaFnTap : .virtualAudioDirect
+        )
         bluetoothVoiceDecodedBatchCount += 1
         bluetoothVoiceDecodedSampleCount += samples.count
-        currentVoiceSampleCount &+= UInt64(samples.count)
+        bluetoothVoiceTailDiagnostics.append(samples, at: ProcessInfo.processInfo.systemUptime)
+        publishCurrentVoiceSampleReceiptIfNeeded(sampleCount: samples.count)
         if !enqueued {
             bluetoothVoiceEnqueueFailureCount += 1
         }
@@ -1738,6 +2634,18 @@ final class BridgeAppModel: ObservableObject, XiaomiBluetoothBridgeDelegate {
                     "model=\(model.rawValue) route=\(bluetoothVoiceTraceRoute) " +
                     "accepted=\(enqueued) first_batch_samples=\(samples.count) " +
                     "pending_buffers=\(audioOutput.pendingVoiceBufferCountForDiagnostics)"
+            )
+        }
+        if rc003VoiceExtensionTestEnabled,
+           rc003VoiceExtensionActive,
+           rc003VoiceExtensionBridge === bridge,
+           !rc003VoiceExtensionAwaitingReopen,
+           !rc003VoiceExtensionDidReceiveAudio {
+            rc003VoiceExtensionDidReceiveAudio = true
+            startRC003VoiceExtensionTimer()
+            AppLogger.shared.write(
+                "RC003 EXTENSION AUDIO_READY session_segment=\(activeBluetoothVoiceTraceID ?? 0) " +
+                    "samples=\(samples.count)"
             )
         }
     }
@@ -1919,6 +2827,10 @@ final class BridgeAppModel: ObservableObject, XiaomiBluetoothBridgeDelegate {
             if phase == .press {
                 macroFeature.noteButtonInteraction(button: button)
             }
+            AppLogger.shared.write(
+                "PHONE REMOTE button=\(button.rawValue) phase=\(phase.rawValue) " +
+                    "path=binding_editor_capture"
+            )
             return true
         }
         let profileID = settings.selectedRemoteProfileID
@@ -2049,7 +2961,7 @@ final class BridgeAppModel: ObservableObject, XiaomiBluetoothBridgeDelegate {
         trigger: ButtonTrigger,
         source: UsageEventSource
     ) -> Bool {
-        if macroFeature.executeBoundMacro(
+        if performButtonProfileBoundAction(
             profileID: settings.selectedRemoteProfileID,
             button: button,
             trigger: trigger
@@ -2085,6 +2997,66 @@ final class BridgeAppModel: ObservableObject, XiaomiBluetoothBridgeDelegate {
                 "action=\(configured.action.rawValue)"
         )
         return true
+    }
+
+    private func performButtonProfileBoundAction(
+        profileID: UUID?,
+        button: RemoteButton,
+        trigger: ButtonTrigger
+    ) -> Bool {
+        macroFeature.executeBoundAction(
+            profileID: profileID,
+            button: button,
+            trigger: trigger,
+            hostActionPerformer: { [weak self] payload in
+                self?.performButtonProfileHostAction(payload) ?? false
+            },
+            shortcutPerformer: { [weak self] keyCode, modifiers in
+                self?.performButtonProfileShortcut(keyCode: keyCode, modifiers: modifiers) ?? false
+            }
+        )
+    }
+
+    private func performButtonProfileHostAction(_ payload: Data) -> Bool {
+        guard let configured = try? JSONDecoder().decode(ConfiguredButtonAction.self, from: payload)
+        else { return false }
+        if configured.action.isAppInternal {
+            return performInternalAction(configured.action)
+        }
+        guard KeyboardInjector.isAccessibilityTrusted else {
+            _ = KeyboardInjector.requestAccessibilityAccess()
+            return false
+        }
+        return performExternalConfiguredAction(configured)
+    }
+
+    private func performButtonProfileShortcut(
+        keyCode: UInt16,
+        modifiers: [String]
+    ) -> Bool {
+        var modifierFlags: NSEvent.ModifierFlags = []
+        for modifier in modifiers {
+            switch modifier {
+            case "command": modifierFlags.insert(.command)
+            case "shift": modifierFlags.insert(.shift)
+            case "option": modifierFlags.insert(.option)
+            case "control": modifierFlags.insert(.control)
+            case "function": modifierFlags.insert(.function)
+            default: return false
+            }
+        }
+        guard KeyboardInjector.isAccessibilityTrusted else {
+            _ = KeyboardInjector.requestAccessibilityAccess()
+            return false
+        }
+        return performExternalConfiguredAction(ConfiguredButtonAction(
+            action: .customShortcut,
+            shortcut: CustomKeyboardShortcut(
+                keyCode: keyCode,
+                modifierFlags: modifierFlags,
+                keyLabel: "Key Code \(keyCode)"
+            )
+        ))
     }
 
     private func performExternalConfiguredAction(_ configured: ConfiguredButtonAction) -> Bool {
@@ -2231,6 +3203,97 @@ final class BridgeAppModel: ObservableObject, XiaomiBluetoothBridgeDelegate {
         longRecordingCloseTimer = nil
     }
 
+    private func scheduleRC003VoiceExtensionOpenTimeout(generation: UInt64) {
+        rc003VoiceExtensionOpenTimer?.cancel()
+        let timer = DispatchSource.makeTimerSource(queue: .main)
+        timer.schedule(deadline: .now() + Self.rc003VoiceExtensionOpenTimeout)
+        timer.setEventHandler { [weak self] in
+            guard let self,
+                  self.rc003VoiceExtensionActive,
+                  self.rc003VoiceExtensionAwaitingReopen,
+                  self.rc003VoiceExtensionGeneration == generation
+            else { return }
+            self.finishRC003VoiceExtensionTest(reason: "reopen_timeout")
+        }
+        rc003VoiceExtensionOpenTimer = timer
+        timer.resume()
+    }
+
+    private func scheduleRC003VoiceExtensionDeadline(generation: UInt64) {
+        rc003VoiceExtensionDeadlineTimer?.cancel()
+        let timer = DispatchSource.makeTimerSource(queue: .main)
+        timer.schedule(deadline: .now() + Self.rc003VoiceExtensionMaximumDuration)
+        timer.setEventHandler { [weak self] in
+            guard let self,
+                  self.rc003VoiceExtensionActive,
+                  self.rc003VoiceExtensionGeneration == generation
+            else { return }
+            self.finishRC003VoiceExtensionTest(reason: "safe_timeout")
+        }
+        rc003VoiceExtensionDeadlineTimer = timer
+        timer.resume()
+    }
+
+    private func startRC003VoiceExtensionTimer() {
+        guard rc003VoiceExtensionTimer == nil,
+              rc003VoiceExtensionActive,
+              !rc003VoiceExtensionAwaitingReopen,
+              rc003VoiceExtensionDidReceiveAudio,
+              let bridge = rc003VoiceExtensionBridge
+        else { return }
+        let generation = rc003VoiceExtensionGeneration
+        let timer = DispatchSource.makeTimerSource(queue: .main)
+        timer.schedule(
+            deadline: .now() + Self.rc003VoiceExtensionInterval,
+            repeating: Self.rc003VoiceExtensionInterval
+        )
+        timer.setEventHandler { [weak self, weak bridge] in
+            guard let self,
+                  let bridge,
+                  self.rc003VoiceExtensionActive,
+                  !self.rc003VoiceExtensionAwaitingReopen,
+                  self.rc003VoiceExtensionGeneration == generation,
+                  self.rc003VoiceExtensionDidReceiveAudio
+            else { return }
+            guard bridge.requestMicrophoneExtend() else {
+                AppLogger.shared.write("RC003 EXTENSION MIC_EXTEND failed")
+                self.finishRC003VoiceExtensionTest(reason: "extend_rejected")
+                return
+            }
+            AppLogger.shared.write("RC003 EXTENSION MIC_EXTEND sent")
+        }
+        rc003VoiceExtensionTimer = timer
+        timer.resume()
+    }
+
+    private func finishRC003VoiceExtensionTest(reason: String) {
+        guard rc003VoiceExtensionActive || rc003VoiceExtensionAwaitingReopen else { return }
+        let bridge = rc003VoiceExtensionBridge
+        let wasStreaming = bluetoothVoiceActive
+        rc003VoiceExtensionActive = false
+        rc003VoiceExtensionAwaitingReopen = false
+        rc003VoiceExtensionDidReceiveAudio = false
+        rc003VoiceExtensionGeneration &+= 1
+        rc003VoiceExtensionTimer?.cancel()
+        rc003VoiceExtensionTimer = nil
+        rc003VoiceExtensionOpenTimer?.cancel()
+        rc003VoiceExtensionOpenTimer = nil
+        rc003VoiceExtensionDeadlineTimer?.cancel()
+        rc003VoiceExtensionDeadlineTimer = nil
+        rc003VoiceExtensionBridge = nil
+        if wasStreaming {
+            _ = bridge?.requestMicrophoneClose()
+            AppLogger.shared.write("RC003 EXTENSION stopping reason=\(reason) close_requested=true")
+            return
+        }
+        activeBluetoothVoiceDeviceIdentifier = nil
+        bluetoothVoiceActive = false
+        _ = voiceFnTapSession.stopVoice()
+        releaseVoiceKeyIfNeeded(owner: .bluetooth, forceSoftware: false)
+        endVoiceSessionIfNeeded(flushAudio: true)
+        AppLogger.shared.write("RC003 EXTENSION finished reason=\(reason)")
+    }
+
     private func startPhoneVoice(source: MobileVoiceSource) -> RemoteVoiceStartResult {
         guard activeMobileVoiceSource == nil else {
             AppLogger.shared.write(
@@ -2247,14 +3310,18 @@ final class BridgeAppModel: ObservableObject, XiaomiBluetoothBridgeDelegate {
             releaseVirtualAudioOutputIfUnused(reason: "mobile_voice_configure_failed")
             return .unavailable
         }
-        guard updatePhoneVoiceFunctionKeyState(streaming: true) else {
+        guard updateVoiceKeyState(
+            streaming: true,
+            forceSoftware: true,
+            owner: .mobile
+        ) else {
             AppLogger.shared.write(
                 "MOBILE VOICE start_rejected reason=function_key requested=\(source.logName)"
             )
             releaseVirtualAudioOutputIfUnused(reason: "mobile_voice_function_key_failed")
             return .unavailable
         }
-        currentVoiceSampleCount = 0
+        resetCurrentVoiceSampleReceipt()
         mobileVoiceLifecycle.markStarted(source)
         mobileVoiceAudioBatchCount = 0
         mobileVoiceAudioEnqueueFailureCount = 0
@@ -2315,12 +3382,12 @@ final class BridgeAppModel: ObservableObject, XiaomiBluetoothBridgeDelegate {
                 case .ignored:
                     return
                 case .stopped:
-                    self.updatePhoneVoiceFunctionKeyState(streaming: false)
+                    self.releaseVoiceKeyIfNeeded(owner: .mobile, forceSoftware: true)
                     self.endVoiceSessionIfNeeded()
                     AppLogger.shared.write("MOBILE VOICE stopped source=\(source.logName)")
                     self.releaseVirtualAudioOutputIfUnused(reason: "mobile_voice_stopped")
                 case let .restart(restartSource):
-                    self.updatePhoneVoiceFunctionKeyState(streaming: false)
+                    self.releaseVoiceKeyIfNeeded(owner: .mobile, forceSoftware: true)
                     self.endVoiceSessionIfNeeded()
                     AppLogger.shared.write("MOBILE VOICE stopped source=\(source.logName)")
                     let completion = self.pendingMobileVoiceRestartCompletion
@@ -2401,17 +3468,27 @@ final class BridgeAppModel: ObservableObject, XiaomiBluetoothBridgeDelegate {
             )
             return
         }
-        cancelVirtualAudioReleaseIfPending(trigger: "superseded_\(reason)", cause: "superseded")
+        guard pendingVirtualAudioRelease == nil else { return }
+        switchDefaultInputToFallbackIfNeeded(reason: reason)
+        let pendingVoiceBufferCount = audioOutput.pendingVoiceBufferCountForDiagnostics
+        guard VirtualAudioConnectionLifecyclePolicy.shouldScheduleRelease(
+            hasPendingRelease: pendingVirtualAudioRelease != nil,
+            hasAllocatedOutputResources: audioOutput.hasAllocatedOutputResources,
+            pendingVoiceBufferCount: pendingVoiceBufferCount
+        ) else {
+            isAudioOutputReady = false
+            testToneStatus = LocalizedMessage("audio.output.none_or_unavailable")
+            return
+        }
         virtualAudioReleaseGeneration &+= 1
         let generation = virtualAudioReleaseGeneration
         pendingVirtualAudioRelease = (generation, reason)
         AppLogger.shared.write(
             "AUDIO RELEASE requested reason=\(reason) generation=\(generation) " +
                 "system_suspended=\(systemAudioSuspensionState.isSuspended) " +
-                "pending_buffers=\(audioOutput.pendingVoiceBufferCountForDiagnostics) " +
+                "pending_buffers=\(pendingVoiceBufferCount) " +
                 "state={\(audioOutput.diagnosticState())}"
         )
-        switchDefaultInputToFallbackIfNeeded(reason: reason)
         audioOutput.endSessionAfterDraining { [weak self] in
             guard let self else { return }
             guard self.virtualAudioReleaseGeneration == generation else {
@@ -2473,7 +3550,8 @@ final class BridgeAppModel: ObservableObject, XiaomiBluetoothBridgeDelegate {
         guard result == noErr else {
             AppLogger.shared.write(
                 "AUDIO DEFAULT_INPUT fallback_failed reason=\(reason) " +
-                    "target={\(CoreAudioDeviceCatalog.deviceDiagnostic(fallback))} error=\(result)"
+                    "target={\(CoreAudioDeviceCatalog.deviceDiagnostic(fallback))} " +
+                    AppLogger.errorFields(domain: "os_status", code: Int(result))
             )
             return
         }
@@ -2518,7 +3596,8 @@ final class BridgeAppModel: ObservableObject, XiaomiBluetoothBridgeDelegate {
         } else {
             AppLogger.shared.write(
                 "AUDIO DEFAULT_INPUT restore_failed reason=\(reason) " +
-                    "target={\(CoreAudioDeviceCatalog.deviceDiagnostic(virtualInput))} error=\(result)"
+                    "target={\(CoreAudioDeviceCatalog.deviceDiagnostic(virtualInput))} " +
+                    AppLogger.errorFields(domain: "os_status", code: Int(result))
             )
         }
     }
@@ -2536,10 +3615,23 @@ final class BridgeAppModel: ObservableObject, XiaomiBluetoothBridgeDelegate {
             }
             return
         }
-        currentVoiceSampleCount &+= UInt64(samples.count)
+        recordingAssetCoordinator.append(samples: samples)
+        publishCurrentVoiceSampleReceiptIfNeeded(sampleCount: samples.count)
         mobileVoiceAudioBatchCount += 1
         mobileVoiceAudioSignalMetrics.append(samples)
-        let accepted = audioOutput.enqueue(samples: samples)
+        let deliveryGeneration = voiceAudioDeliveryDiagnostic.generation
+        let accepted = audioOutput.enqueue(
+            samples: samples,
+            deliveryGeneration: deliveryGeneration
+        )
+        recordVoiceAudioReceipt(
+            samples: samples,
+            route: .virtualAudioDirect
+        )
+        recordVoiceAudioEnqueueOutcome(
+            accepted: accepted,
+            deliveryGeneration: deliveryGeneration
+        )
         if !accepted { mobileVoiceAudioEnqueueFailureCount += 1 }
         if mobileVoiceAudioBatchCount == 1 || mobileVoiceAudioBatchCount.isMultiple(of: 20) {
             AppLogger.shared.write(
@@ -2566,9 +3658,77 @@ final class BridgeAppModel: ObservableObject, XiaomiBluetoothBridgeDelegate {
         )
     }
 
+    private func resetCurrentVoiceSampleReceipt() {
+        guard hasReceivedCurrentVoiceSamples else { return }
+        hasReceivedCurrentVoiceSamples = false
+    }
+
+    private func publishCurrentVoiceSampleReceiptIfNeeded(sampleCount: Int) {
+        guard VoiceSamplePresentationPolicy.shouldPublishReceipt(
+            hasReceivedSamples: hasReceivedCurrentVoiceSamples,
+            sampleCount: sampleCount
+        ) else { return }
+        hasReceivedCurrentVoiceSamples = true
+    }
+
+    func voiceAudioDeliveryDiagnosticSnapshot() -> VoiceAudioDeliveryDiagnostic {
+        var diagnostic = voiceAudioDeliveryDiagnostic
+        diagnostic.outputAtObservation = audioOutput.diagnosticSnapshot(
+            deliveryGeneration: diagnostic.generation
+        )
+        return diagnostic
+    }
+
+    private func recordVoiceAudioReceipt(
+        samples: [Int16],
+        route: VoiceAudioDeliveryRoute
+    ) {
+        guard !samples.isEmpty, voiceAudioDeliveryDiagnostic.generation > 0 else { return }
+        voiceAudioDeliveryDiagnostic.route = route
+        voiceAudioDeliveryDiagnostic.receivedBatches += 1
+        voiceAudioDeliveryDiagnostic.receivedSamples += samples.count
+        voiceAudioDeliveryDiagnostic.outputAtObservation = audioOutput.diagnosticSnapshot(
+            deliveryGeneration: voiceAudioDeliveryDiagnostic.generation
+        )
+    }
+
+    private func recordVoiceAudioEnqueueOutcome(
+        accepted: Bool,
+        deliveryGeneration: Int
+    ) {
+        guard !accepted,
+              deliveryGeneration > 0,
+              voiceAudioDeliveryDiagnostic.generation == deliveryGeneration
+        else { return }
+        voiceAudioDeliveryDiagnostic.enqueueFailures += 1
+        voiceAudioDeliveryDiagnostic.outputAtObservation = audioOutput.diagnosticSnapshot(
+            deliveryGeneration: deliveryGeneration
+        )
+    }
+
+    private func enqueueVoiceFnTapAudio(_ samples: [Int16]) {
+        let deliveryGeneration = voiceAudioDeliveryDiagnostic.generation
+        let accepted = audioOutput.enqueue(
+            samples: samples,
+            deliveryGeneration: deliveryGeneration
+        )
+        recordVoiceAudioEnqueueOutcome(
+            accepted: accepted,
+            deliveryGeneration: deliveryGeneration
+        )
+        if !accepted {
+            bluetoothVoiceEnqueueFailureCount += 1
+        }
+    }
+
     private func archiveCapturedTranscript(_ capture: CapturedTranscript) {
         let transcript = capture.text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !transcript.isEmpty else { return }
+        recordingAssetCoordinator.updateApplication(
+            sessionID: capture.sessionID,
+            applicationName: capture.applicationName,
+            bundleIdentifier: capture.bundleIdentifier
+        )
+        guard settings.localTranscriptHistoryEnabled, !transcript.isEmpty else { return }
         let record = TranscriptRecord(
             sessionID: capture.sessionID,
             startedAt: capture.startedAt,
@@ -2607,11 +3767,41 @@ final class BridgeAppModel: ObservableObject, XiaomiBluetoothBridgeDelegate {
         )
         let startedAt = Date()
         let source = currentVoiceUsageSource
+        let sessionID = UUID()
+        voiceAudioDeliveryGeneration &+= 1
+        let audioSnapshot = audioOutput.diagnosticSnapshot(
+            deliveryGeneration: voiceAudioDeliveryGeneration
+        )
+        voiceAudioDeliveryDiagnostic = VoiceAudioDeliveryDiagnostic(
+            generation: voiceAudioDeliveryGeneration,
+            source: source.rawValue,
+            outputAtStart: audioSnapshot,
+            outputAtObservation: audioSnapshot,
+            countersAtStart: audioSnapshot.counters
+        )
         activeVoiceSource = source
         settings.recordButtonPress(control: .voice, source: source, at: startedAt)
         voiceSessionStartedAt = startedAt
+        voiceSessionID = sessionID
         voiceSessionUsageSource = source
-        transcriptCaptureCoordinator.startSession(startedAt: startedAt, source: source)
+        let frontmostApplication = FrontmostApplicationMetadata.current(
+            excludingBundleIdentifier: Bundle.main.bundleIdentifier
+        )
+        recordingAssetCoordinator.start(
+            sessionID: sessionID,
+            startedAt: startedAt,
+            source: source,
+            applicationMetadata: frontmostApplication
+        )
+        if let frontmostApplication {
+            AppLogger.shared.write(
+                "RECORDING ASSET application_fallback " +
+                    "bundle=\(frontmostApplication.bundleIdentifier)"
+            )
+        } else {
+            AppLogger.shared.write("RECORDING ASSET application_fallback unavailable")
+        }
+        transcriptCaptureCoordinator.startSession(sessionID: sessionID, startedAt: startedAt, source: source)
         isStreaming = true
     }
 
@@ -2628,6 +3818,12 @@ final class BridgeAppModel: ObservableObject, XiaomiBluetoothBridgeDelegate {
             self.voiceSessionStartedAt = nil
         }
         voiceSessionUsageSource = nil
+        let sessionID = voiceSessionID
+        voiceSessionID = nil
+        voiceAudioDeliveryDiagnostic.sessionEnded = true
+        voiceAudioDeliveryDiagnostic.outputAtObservation = audioOutput.diagnosticSnapshot(
+            deliveryGeneration: voiceAudioDeliveryDiagnostic.generation
+        )
         isStreaming = false
         activeVoiceSource = nil
         if flushAudio {
@@ -2635,6 +3831,9 @@ final class BridgeAppModel: ObservableObject, XiaomiBluetoothBridgeDelegate {
         }
         privateFeature.finishVoiceSession()
         transcriptCaptureCoordinator.finishSession(endedAt: endedAt)
+        if sessionID != nil {
+            recordingAssetCoordinator.finish(endedAt: endedAt)
+        }
     }
 
     private var currentVoiceUsageSource: UsageEventSource {
@@ -2655,31 +3854,108 @@ final class BridgeAppModel: ObservableObject, XiaomiBluetoothBridgeDelegate {
         if !isStreaming {
             isVoiceTriggerEnabled = applied
             voiceShortcutStatus = LocalizedMessage(
-                applied ? "voice_button.status.fn_enabled" : "voice_button.status.waiting"
+                applied
+                    ? "voice_button.status.\(settings.voiceKeyMode.rawValue)_enabled"
+                    : "voice_button.status.waiting"
             )
         }
         return !settings.customMappingEnabled || voiceFunctionMapper.isPowerKeySuppressed
     }
 
     @discardableResult
-    private func updatePhoneVoiceFunctionKeyState(streaming: Bool) -> Bool {
-        guard let transition = phoneVoiceFunctionKeyLatch.transition(streaming: streaming) else {
+    private func updateVoiceKeyState(
+        streaming: Bool,
+        forceSoftware: Bool,
+        owner: VoiceFunctionKeyLatch.Owner
+    ) -> Bool {
+        let mode = streaming ? settings.voiceKeyMode : (heldVoiceKeyMode ?? settings.voiceKeyMode)
+        guard forceSoftware || !mode.usesHardwareMapping else { return true }
+        guard let transition = voiceKeyLatch.transition(
+            streaming: streaming,
+            owner: owner
+        ) else {
             return true
         }
         let shouldHold = transition == .press
-        guard KeyboardInjector.setFunctionKeyPressed(shouldHold) else {
-            phoneVoiceFunctionKeyLatch.rollback(transition)
+        guard KeyboardInjector.setVoiceKeyPressed(mode, isPressed: shouldHold) else {
+            voiceKeyLatch.rollback(transition, owner: owner)
             AppLogger.shared.write(
-                "PHONE VOICE FN \(shouldHold ? "DOWN" : "UP") failed"
+                "VOICE KEY \(mode.rawValue) \(shouldHold ? "DOWN" : "UP") failed"
             )
             return false
         }
+        if mode != .function {
+            if shouldHold {
+                preferredInputSourceMonitor.beginVoiceSession()
+            } else {
+                preferredInputSourceMonitor.endVoiceSession()
+            }
+        }
+        if shouldHold {
+            heldVoiceKeyMode = mode
+        } else {
+            heldVoiceKeyMode = nil
+        }
         isVoiceTriggerEnabled = !shouldHold
         voiceShortcutStatus = LocalizedMessage(
-            shouldHold ? "voice_button.status.fn_pressed" : "voice_button.status.fn_released"
+            shouldHold
+                ? "voice_button.status.\(mode.rawValue)_pressed"
+                : "voice_button.status.\(mode.rawValue)_released"
         )
         AppLogger.shared.write(
-            "PHONE VOICE FN \(shouldHold ? "DOWN" : "UP")"
+            "VOICE KEY mode=\(mode.rawValue) \(shouldHold ? "DOWN" : "UP")"
+        )
+        return true
+    }
+
+    @discardableResult
+    private func releaseVoiceKeyIfNeeded(
+        owner: VoiceFunctionKeyLatch.Owner,
+        forceSoftware: Bool
+    ) -> Bool {
+        guard !updateVoiceKeyState(
+            streaming: false,
+            forceSoftware: forceSoftware,
+            owner: owner
+        ) else { return true }
+        return releaseVoiceKeyIfNeeded()
+    }
+
+    @discardableResult
+    private func releaseVoiceKeyIfNeeded() -> Bool {
+        guard voiceKeyLatch.isHeld else {
+            heldVoiceKeyMode = nil
+            return true
+        }
+        guard let heldVoiceKeyMode else { return false }
+
+        var forcedAfterPermissionChange = false
+        var released = KeyboardInjector.setVoiceKeyPressed(
+            heldVoiceKeyMode,
+            isPressed: false
+        )
+        if !released {
+            forcedAfterPermissionChange = true
+            released = KeyboardInjector.setVoiceKeyPressed(
+                heldVoiceKeyMode,
+                isPressed: false,
+                accessibilityTrusted: { true }
+            )
+        }
+        guard released else { return false }
+
+        voiceKeyLatch.reset()
+        self.heldVoiceKeyMode = nil
+        if heldVoiceKeyMode != .function {
+            preferredInputSourceMonitor.endVoiceSession()
+        }
+        isVoiceTriggerEnabled = true
+        voiceShortcutStatus = LocalizedMessage(
+            "voice_button.status.\(heldVoiceKeyMode.rawValue)_released"
+        )
+        AppLogger.shared.write(
+            "VOICE KEY mode=\(heldVoiceKeyMode.rawValue) UP" +
+                (forcedAfterPermissionChange ? " forced_after_permission_change" : "")
         )
         return true
     }

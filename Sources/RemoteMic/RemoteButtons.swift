@@ -96,6 +96,11 @@ enum RemoteButton: String, CaseIterable, Codable, Identifiable {
         case .back: return nil
         }
     }
+
+    var nativeEvents: Set<RemoteNativeEvent> {
+        guard let nativeEvent else { return [] }
+        return self == .tv ? [nativeEvent, .keyboard(keyCode: 50)] : [nativeEvent]
+    }
 }
 
 enum RemoteNativeEvent: Hashable {
@@ -146,7 +151,14 @@ struct CustomKeyboardShortcut: Codable, Equatable {
         return flags
     }
 
+    var standaloneModifier: StandaloneKeyboardModifier? {
+        StandaloneKeyboardModifier.matching(self)
+    }
+
     func displayName(using localization: LocalizationStore) -> String {
+        if let standaloneModifier {
+            return standaloneModifier.displayName(using: localization)
+        }
         var result = ""
         if modifierFlags.contains(.control) { result += "⌃" }
         if modifierFlags.contains(.option) { result += "⌥" }
@@ -438,6 +450,8 @@ enum ButtonAction: String, CaseIterable, Codable, Identifiable {
     case arrowDown
     case arrowLeft
     case arrowRight
+    case scrollUp
+    case scrollDown
     case deleteBackward
     case showDesktop
     case contextMenu
@@ -449,6 +463,7 @@ enum ButtonAction: String, CaseIterable, Codable, Identifiable {
     case previousCommandLeft
     case nextCommandRight
     case customShortcut
+    case focusInput
     case openCustomApplication
     case toggleLongRecording
     case openRemoteMic
@@ -489,6 +504,8 @@ enum ButtonAction: String, CaseIterable, Codable, Identifiable {
         case .arrowDown: return localization.text("action.arrow_down")
         case .arrowLeft: return localization.text("action.arrow_left")
         case .arrowRight: return localization.text("action.arrow_right")
+        case .scrollUp: return localization.text("action.scroll_up")
+        case .scrollDown: return localization.text("action.scroll_down")
         case .deleteBackward: return localization.text("action.delete_backspace")
         case .showDesktop: return localization.text("action.show_desktop")
         case .contextMenu: return localization.text("action.context_menu")
@@ -500,6 +517,7 @@ enum ButtonAction: String, CaseIterable, Codable, Identifiable {
         case .previousCommandLeft: return localization.text("action.previous_command_left")
         case .nextCommandRight: return localization.text("action.next_command_right")
         case .customShortcut: return localization.text("action.custom_shortcut")
+        case .focusInput: return localization.text("action.focus_input")
         case .openCustomApplication: return localization.text("action.open_custom_application")
         case .toggleLongRecording: return localization.text("action.toggle_long_recording")
         case .openRemoteMic: return localization.text("action.open_remote_mic")
@@ -543,12 +561,13 @@ enum ButtonAction: String, CaseIterable, Codable, Identifiable {
         case .disabled, .escape, .returnKey, .commandReturn, .shiftReturn, .commandCopy,
              .commandPaste, .commandClose, .commandQuit, .commandCut, .commandSelectAll,
              .commandUndo, .commandRedo, .commandFind, .commandSave, .commandDelete,
-             .arrowUp, .arrowDown, .arrowLeft, .arrowRight, .deleteBackward:
+             .arrowUp, .arrowDown, .arrowLeft, .arrowRight, .scrollUp, .scrollDown,
+             .deleteBackward:
             return .basicKeys
         case .showDesktop, .contextMenu, .appSwitcher, .volumeUp, .volumeDown, .volumeMute,
              .playPause, .previousCommandLeft, .nextCommandRight, .toggleLongRecording:
             return .systemAndMedia
-        case .customShortcut, .openCustomApplication:
+        case .customShortcut, .focusInput, .openCustomApplication:
             return .custom
         case .openRemoteMic, .openCodex, .openClaude, .openCmux, .openWeChat, .openCursor,
              .openXcode, .openSlack, .openWeCom, .openNeteaseMusic, .openChrome, .openSafari,
@@ -560,6 +579,7 @@ enum ButtonAction: String, CaseIterable, Codable, Identifiable {
     var allowsRepeat: Bool {
         ![
             .customShortcut,
+            .focusInput,
             .openCustomApplication,
             .commandReturn,
             .shiftReturn,
@@ -635,10 +655,13 @@ enum HIDPermissionGate {
     static func nextPermissionRequest(
         mappingEnabled: Bool,
         voiceFnTapModeEnabled: Bool = false,
+        voiceKeyMode: VoiceKeyMode = .function,
         inputMonitoringGranted: Bool,
         accessibilityGranted: Bool
     ) -> HIDPermissionRequest {
-        guard mappingEnabled || voiceFnTapModeEnabled else { return .none }
+        guard mappingEnabled || voiceFnTapModeEnabled || voiceKeyMode.requiresAccessibility else {
+            return .none
+        }
         if mappingEnabled, !inputMonitoringGranted { return .inputMonitoring }
         if !accessibilityGranted { return .accessibility }
         return .none

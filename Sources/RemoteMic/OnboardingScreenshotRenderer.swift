@@ -66,6 +66,9 @@ enum OnboardingScreenshotRenderer {
         let requestedVoiceTool = ProcessInfo.processInfo.environment[
             "REMOTE_MIC_ONBOARDING_SCREENSHOT_VOICE_TOOL"
         ].flatMap(OnboardingVoiceTool.init(rawValue:))
+        let requestedVoiceKeyMode = ProcessInfo.processInfo.environment[
+            "REMOTE_MIC_ONBOARDING_SCREENSHOT_VOICE_KEY_MODE"
+        ].flatMap(VoiceKeyMode.init(rawValue:))
         let requestedGuideStep = ProcessInfo.processInfo.environment[
             "REMOTE_MIC_ONBOARDING_SCREENSHOT_GUIDE_STEP"
         ].flatMap(Int.init) ?? 0
@@ -75,7 +78,13 @@ enum OnboardingScreenshotRenderer {
         let systemFunctionKeyAvailable = ProcessInfo.processInfo.environment[
             "REMOTE_MIC_ONBOARDING_SCREENSHOT_SYSTEM_FN_AVAILABLE"
         ].map { $0 != "0" } ?? true
+        let allVoiceToolsUnavailable = ProcessInfo.processInfo.environment[
+            "REMOTE_MIC_ONBOARDING_SCREENSHOT_ALL_VOICE_TOOLS_UNAVAILABLE"
+        ] == "1"
         let controlMethod = requestedControlMethod ?? .physicalRemote
+        if let requestedVoiceKeyMode {
+            settings.voiceKeyMode = requestedVoiceKeyMode
+        }
         settings.setOnboardingVoiceTool(requestedVoiceTool ?? .doubao)
         settings.setOnboardingRemoteAvailability(
             controlMethod == .physicalRemote ? .hasRemote : .noRemote
@@ -110,6 +119,11 @@ enum OnboardingScreenshotRenderer {
                 completeRuntimeReadyOverride: true,
                 allowsInputSourceSwitching: false,
                 systemFunctionKeyAvailableOverride: systemFunctionKeyAvailable,
+                voiceToolAvailabilityOverride: [
+                    .doubao: allVoiceToolsUnavailable ? .notInstalled : .available,
+                    .weixin: allVoiceToolsUnavailable ? .notInstalled : .available,
+                    .typeless: allVoiceToolsUnavailable ? .notInstalled : .available,
+                ],
                 initialInputMethodGuideStep: requestedGuideStep
             )
                 .environmentObject(localization)
